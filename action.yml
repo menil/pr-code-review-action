@@ -12,7 +12,7 @@ inputs:
   openrouter_model:
     description: 'Model to use for code review'
     required: false
-    default: 'google/gemini-2.0-flash'
+    default: 'openrouter/free'
   openrouter_base_url:
     description: 'Base URL for OpenRouter completions API'
     required: false
@@ -24,7 +24,7 @@ inputs:
   github_token:
     description: 'GITHUB_TOKEN for posting review comments'
     required: false
-    default: ${{ github.token }}
+    default: '${{ github.token }}'
 
 runs:
   using: 'composite'
