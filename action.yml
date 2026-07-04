@@ -1,0 +1,54 @@
+name: 'AI PR Code Reviewer'
+description: 'Runs automated LLM reviews on PR diffs via OpenRouter and submits inline comments.'
+author: 'meni'
+branding:
+  icon: 'code'
+  color: 'blue'
+
+inputs:
+  openrouter_api_key:
+    description: 'API key for OpenRouter'
+    required: true
+  openrouter_model:
+    description: 'Model to use for code review'
+    required: false
+    default: 'google/gemini-2.0-flash'
+  openrouter_base_url:
+    description: 'Base URL for OpenRouter completions API'
+    required: false
+    default: 'https://openrouter.ai/api/v1/chat/completions'
+  openrouter_max_tokens:
+    description: 'Maximum tokens for LLM response'
+    required: false
+    default: '4096'
+  github_token:
+    description: 'GITHUB_TOKEN for posting review comments'
+    required: false
+    default: ${{ github.token }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Fetch PR Diff
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+      run: |
+        gh pr diff ${{ github.event.pull_request.number }} --repo ${{ github.repository }} > pr.diff
+
+    - name: Run Review Script
+      shell: bash
+      env:
+        OPENROUTER_API_KEY: ${{ inputs.openrouter_api_key }}
+        OPENROUTER_MODEL: ${{ inputs.openrouter_model }}
+        OPENROUTER_BASE_URL: ${{ inputs.openrouter_base_url }}
+        OPENROUTER_MAX_TOKENS: ${{ inputs.openrouter_max_tokens }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        REPO: ${{ github.repository }}
+        GH_TOKEN: ${{ inputs.github_token }}
+      run: python ${{ github.action_path }}/pr_review.py
