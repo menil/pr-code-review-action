@@ -1,5 +1,6 @@
 """Unit tests for the automated code review script."""
 
+from unittest.mock import MagicMock, patch
 from pr_review import get_modified_lines, parse_llm_json, truncate_diff
 
 
@@ -100,3 +101,121 @@ def test_truncate_diff() -> None:
     truncated_no_nl = truncate_diff(no_newline_text, 5)
     assert truncated_no_nl.startswith("abcde\n\n")
     assert "truncated" in truncated_no_nl
+
+
+@patch("urllib.request.urlopen")
+def test_send_request_success(mock_urlopen: MagicMock) -> None:
+    import json
+    import urllib.request
+    from pr_review import _send_request
+
+    mock_res = MagicMock()
+    mock_res.read.return_value = json.dumps(
+        {"choices": [{"message": {"content": '{"summary": "OK"}'}}]}
+    ).encode("utf-8")
+    mock_urlopen.return_value.__enter__.return_value = mock_res
+
+    content = _send_request(
+        url="http://dummy",
+        payload={"dummy": "data"},
+        headers={"Authorization": "Bearer key"},
+    )
+
+    assert content == '{"summary": "OK"}'
+    mock_urlopen.assert_called_once()
+    args, kwargs = mock_urlopen.call_args
+    assert isinstance(args[0], urllib.request.Request)
+    assert kwargs.get("timeout") == 30
+
+
+@patch("urllib.request.urlopen")
+def test_send_request_empty_choices(mock_urlopen: MagicMock) -> None:
+    import pytest
+    from pr_review import _send_request
+
+    mock_res = MagicMock()
+    mock_res.read.return_value = b'{"choices": []}'
+    mock_urlopen.return_value.__enter__.return_value = mock_res
+
+    with pytest.raises(ValueError, match="OpenRouter returned empty choices"):
+        _send_request("http://dummy", {}, {})
+
+
+@patch("urllib.request.urlopen")
+def test_send_request_non_string_content(mock_urlopen: MagicMock) -> None:
+    import pytest
+    from pr_review import _send_request
+
+    mock_res = MagicMock()
+    mock_res.read.return_value = b'{"choices": [{"message": {"content": 123}}]}'
+    mock_urlopen.return_value.__enter__.return_value = mock_res
+
+    with pytest.raises(
+        ValueError, match="OpenRouter returned non-string message content"
+    ):
+        _send_request("http://dummy", {}, {})
+
+
+@patch("pr_review._send_request")
+def test_make_openrouter_request_success(mock_send_request: MagicMock) -> None:
+    from pr_review import make_openrouter_request
+
+    mock_send_request.return_value = '{"summary": "Review complete"}'
+
+    result = make_openrouter_request("fake_key", "fake_diff")
+
+    assert result == '{"summary": "Review complete"}'
+    mock_send_request.assert_called_once()
+    args, kwargs = mock_send_request.call_args
+    payload = args[1]
+    assert payload["response_format"] == {"type": "json_object"}
+
+
+@patch("pr_review._send_request")
+def test_make_openrouter_request_fallback_success(mock_send_request: MagicMock) -> None:
+    from pr_review import make_openrouter_request
+
+    mock_send_request.side_effect = [
+        Exception("HTTP Error 400: Bad Request"),
+        '{"summary": "Fallback works"}',
+    ]
+
+    result = make_openrouter_request("fake_key", "fake_diff")
+
+    assert result == '{"summary": "Fallback works"}'
+    assert mock_send_request.call_count == 2
+
+    first_call_payload = mock_send_request.call_args_list[0][0][1]
+    assert "response_format" in first_call_payload
+
+    second_call_payload = mock_send_request.call_args_list[1][0][1]
+    assert "response_format" not in second_call_payload
+
+
+@patch("pr_review._send_request")
+def test_make_openrouter_request_fallback_failure(mock_send_request: MagicMock) -> None:
+    import pytest
+    from pr_review import make_openrouter_request
+
+    mock_send_request.side_effect = [
+        Exception("HTTP Error 400: Bad Request"),
+        Exception("Fallback failed"),
+    ]
+
+    with pytest.raises(Exception, match="Fallback failed"):
+        make_openrouter_request("fake_key", "fake_diff")
+    assert mock_send_request.call_count == 2
+
+
+@patch("pr_review._send_request")
+def test_make_openrouter_request_no_fallback_on_unauthorized(
+    mock_send_request: MagicMock,
+) -> None:
+    import pytest
+    from pr_review import make_openrouter_request
+
+    mock_send_request.side_effect = Exception("HTTP Error 401: Unauthorized")
+
+    with pytest.raises(Exception, match="HTTP Error 401: Unauthorized"):
+        make_openrouter_request("fake_key", "fake_diff")
+    assert mock_send_request.call_count == 1
