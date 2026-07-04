@@ -110,6 +110,50 @@ def truncate_diff(diff_content: str, limit: int = 500000) -> str:
     return diff_content
 
 
+def _send_request(url: str, payload: dict[str, Any], headers: dict[str, str]) -> str:
+    """Send HTTP request to OpenRouter and handle errors/timeouts.
+
+    Args:
+        url: The target OpenRouter API endpoint URL.
+        payload: The request body containing model instructions and settings.
+        headers: Dict containing headers (Authorization, X-Title, etc.).
+
+    Returns:
+        The raw text content returned in the model's chat completion choice.
+
+    Raises:
+        ValueError: If the response is empty, malformed, or missing message content.
+        urllib.error.HTTPError: If the server returns a non-2xx status code.
+    """
+    req = urllib.request.Request(
+        url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as res:
+            res_content = res.read(10 * 1024 * 1024).decode("utf-8", errors="replace")
+            res_data = json.loads(res_content)
+            choices = res_data.get("choices", [])
+            if not choices:
+                truncated_res = (
+                    res_content[:1000] + "..."
+                    if len(res_content) > 1000
+                    else res_content
+                )
+                raise ValueError(
+                    f"OpenRouter returned empty choices. Full response: {truncated_res}"
+                )
+            content = choices[0]["message"]["content"]
+            if not isinstance(content, str):
+                raise ValueError("OpenRouter returned non-string message content.")
+            return content
+    except urllib.error.HTTPError as e:
+        try:
+            err_body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            err_body = "<could not read HTTP error body>"
+        raise ValueError(f"OpenRouter HTTP Error {e.code}: {err_body}") from e
+
+
 def make_openrouter_request(api_key: str, diff_content: str) -> str:
     """Call OpenRouter API to review the diff content using Gemini 2.0 Flash."""
     url = os.environ.get(
@@ -168,29 +212,28 @@ def make_openrouter_request(api_key: str, diff_content: str) -> str:
         "max_tokens": max_tokens,
     }
 
-    req = urllib.request.Request(
-        url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST"
-    )
-
+    print(f"Requesting review from OpenRouter using model: {model} (JSON mode)...")
     try:
-        with urllib.request.urlopen(req) as res:
-            res_data = json.loads(res.read().decode("utf-8"))
-            choices = res_data.get("choices", [])
-            if not choices:
-                raise ValueError("OpenRouter returned empty choices.")
-            content = choices[0]["message"]["content"]
-            if not isinstance(content, str):
-                raise ValueError("OpenRouter returned non-string message content.")
-            return content
-    except urllib.error.HTTPError as e:
-        print(
-            f"OpenRouter HTTP Error {e.code}: {e.read().decode('utf-8')}",
-            file=sys.stderr,
-        )
-        raise
+        return _send_request(url, payload, headers)
     except Exception as e:
-        print(f"OpenRouter Error: {e}", file=sys.stderr)
-        raise
+        err_msg = str(e)
+        if "HTTP Error 400" in err_msg or "HTTP Error 422" in err_msg:
+            print(
+                f"Warning: JSON-mode request failed: {e}. Retrying without strict JSON format constraint...",
+                file=sys.stderr,
+            )
+            payload_fallback = payload.copy()
+            payload_fallback.pop("response_format", None)
+            try:
+                return _send_request(url, payload_fallback, headers)
+            except Exception as fallback_err:
+                print(
+                    f"Error: Fallback request also failed: {fallback_err}",
+                    file=sys.stderr,
+                )
+                raise fallback_err
+        else:
+            raise
 
 
 def submit_github_review(
@@ -215,7 +258,7 @@ def submit_github_review(
     )
 
     try:
-        with urllib.request.urlopen(req) as res:
+        with urllib.request.urlopen(req, timeout=30) as res:
             print("Successfully submitted code review to GitHub.")
             result = json.loads(res.read().decode("utf-8"))
             if not isinstance(result, dict):
