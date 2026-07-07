@@ -8,6 +8,7 @@ only changed lines, and submits the review to GitHub.
 
 import json
 import os
+import re
 import sys
 from typing import Any
 import urllib.error
@@ -21,13 +22,22 @@ def get_modified_lines(diff_text: str) -> dict[str, set[int]]:
     new_line_num: int = 0
 
     for line in diff_text.splitlines():
-        if line.startswith("+++ b/"):
-            current_file = line[6:]
-            modified[current_file] = set()
+        if line.startswith("+++ "):
+            path_part = line[4:]
+            if path_part.startswith('"') and path_part.endswith('"'):
+                path_part = path_part[1:-1]
+            if path_part.startswith("b/"):
+                current_file = path_part[2:]
+                modified[current_file] = set()
+            elif path_part == "/dev/null":
+                current_file = None
+            else:
+                current_file = path_part
+                modified[current_file] = set()
         elif line.startswith("@@"):
             try:
                 # Format: @@ -old_start,old_len +new_start,new_len @@ ...
-                parts = line.split(" ")
+                parts = line.split()
                 if len(parts) >= 3:
                     new_info = parts[2]  # e.g., "+new_start,new_len" or "+new_start"
                     if new_info.startswith("+"):
@@ -48,13 +58,65 @@ def get_modified_lines(diff_text: str) -> dict[str, set[int]]:
     return modified
 
 
+def annotate_diff(diff_text: str) -> str:
+    """Annotate a unified diff with new line numbers for modified and context lines."""
+    annotated_lines = []
+    current_file: str | None = None
+    new_line_num: int = 0
+
+    for line in diff_text.splitlines():
+        if line.startswith("+++ "):
+            path_part = line[4:]
+            if path_part.startswith('"') and path_part.endswith('"'):
+                path_part = path_part[1:-1]
+            if path_part.startswith("b/"):
+                current_file = path_part[2:]
+            elif path_part == "/dev/null":
+                current_file = None
+            else:
+                current_file = path_part
+            annotated_lines.append(line)
+        elif line.startswith("@@"):
+            try:
+                parts = line.split()
+                if len(parts) >= 3:
+                    new_info = parts[2]
+                    if new_info.startswith("+"):
+                        new_start = int(new_info[1:].split(",")[0])
+                        new_line_num = new_start - 1
+            except (ValueError, IndexError):
+                current_file = None
+            annotated_lines.append(line)
+        elif current_file is not None:
+            if line.startswith("+") and not line.startswith("+++"):
+                new_line_num += 1
+                annotated_lines.append(f"{new_line_num:5d}: {line}")
+            elif line.startswith(" "):
+                new_line_num += 1
+                annotated_lines.append(f"{new_line_num:5d}: {line}")
+            elif line.startswith("-") and not line.startswith("---"):
+                annotated_lines.append(f"     : {line}")
+            else:
+                annotated_lines.append(line)
+        else:
+            annotated_lines.append(line)
+
+    return "\n".join(annotated_lines)
+
+
 def parse_llm_json(response_text: str) -> dict[str, Any]:
     """Parse JSON output from LLM, stripping markdown block wrappers or extracting the JSON block."""
     response_text = response_text.strip()
 
+    def clean_json(text: str) -> str:
+        # Replace trailing commas (ignoring those inside strings)
+        return re.sub(
+            r'("(?:\\.|[^"\\])*")|,(\s*[}\]])', lambda m: m.group(1) or m.group(2), text
+        )
+
     # Try direct parse first
     try:
-        result = json.loads(response_text)
+        result = json.loads(clean_json(response_text), strict=False)
         if isinstance(result, dict):
             return result
     except json.JSONDecodeError:
@@ -69,7 +131,7 @@ def parse_llm_json(response_text: str) -> dict[str, Any]:
             lines = lines[:-1]
         cleaned = "\n".join(lines).strip()
         try:
-            result = json.loads(cleaned)
+            result = json.loads(clean_json(cleaned), strict=False)
             if isinstance(result, dict):
                 return result
         except json.JSONDecodeError:
@@ -81,7 +143,7 @@ def parse_llm_json(response_text: str) -> dict[str, Any]:
     if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
         json_candidate = response_text[first_brace : last_brace + 1]
         try:
-            result = json.loads(json_candidate)
+            result = json.loads(clean_json(json_candidate), strict=False)
             if isinstance(result, dict):
                 return result
         except json.JSONDecodeError:
@@ -181,6 +243,8 @@ def make_openrouter_request(api_key: str, diff_content: str) -> str:
 
     system_instruction = (
         "You are an expert, constructive code reviewer. Analyze the provided pull request diff.\n"
+        "The diff lines are annotated with their line numbers in the new version of the file (e.g. '   42: + added_line' or '   43:   context_line').\n"
+        "Lines beginning with '     :' represent deleted lines and should not be commented on.\n"
         "Generate concrete, helpful code review feedback targeting issues, bugs, and improvements.\n"
         "CRITICAL RULES for inline comments:\n"
         "1. ONLY comment on lines that have actual bugs, logic errors, safety/security concerns, "
@@ -190,7 +254,8 @@ def make_openrouter_request(api_key: str, diff_content: str) -> str:
         "4. If a file or line is fine, do NOT generate any inline comments for it.\n"
         "5. DO NOT print out line-by-line listings of the diff or repeat large chunks of code in your response. "
         "This wastes tokens and causes the response to be truncated, resulting in parsing errors. "
-        "Only reference line numbers directly in the JSON response.\n\n"
+        "Only reference line numbers directly in the JSON response.\n"
+        '6. Ensure that all string values in the JSON response are properly escaped. Double quotes inside strings must be escaped as \\".\n\n'
         "Group your findings into:\n"
         "1. Critical correctness or logic bugs (edge cases, off-by-one errors).\n"
         "2. Security vulnerabilities.\n"
@@ -217,11 +282,16 @@ def make_openrouter_request(api_key: str, diff_content: str) -> str:
     except ValueError:
         max_tokens = 4096
 
+    annotated_diff = annotate_diff(diff_content)
+
     payload = {
         "model": model,
         "messages": [
             {"role": "system", "content": system_instruction},
-            {"role": "user", "content": f"Please review this diff:\n\n{diff_content}"},
+            {
+                "role": "user",
+                "content": f"Please review this annotated diff:\n\n{annotated_diff}",
+            },
         ],
         "response_format": {"type": "json_object"},
         "temperature": 0.2,
@@ -378,11 +448,19 @@ def main() -> None:
         except ValueError:
             continue
 
+        # Normalize path: strip a/ or b/ prefixes and leading slashes
+        norm_path = path
+        if norm_path.startswith("b/"):
+            norm_path = norm_path[2:]
+        elif norm_path.startswith("a/"):
+            norm_path = norm_path[2:]
+        norm_path = norm_path.lstrip("/")
+
         # Enforce that the path exists in our diff and the line number is part of the changed chunk
-        if path in modified_lines and line_int in modified_lines[path]:
+        if norm_path in modified_lines and line_int in modified_lines[norm_path]:
             valid_comments.append(
                 {
-                    "path": path,
+                    "path": norm_path,
                     "line": line_int,
                     "side": "RIGHT",
                     "body": body,
