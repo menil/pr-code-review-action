@@ -156,6 +156,49 @@ def test_send_request_non_string_content(mock_urlopen: MagicMock) -> None:
         _send_request("http://dummy", {}, {})
 
 
+@patch("urllib.request.urlopen")
+def test_send_request_error_response(mock_urlopen: MagicMock) -> None:
+    import pytest
+    from pr_review import _send_request
+
+    mock_res = MagicMock()
+    mock_res.read.return_value = (
+        b'{"error": {"message": "Model not found", "code": 404}}'
+    )
+    mock_urlopen.return_value.__enter__.return_value = mock_res
+
+    with pytest.raises(ValueError, match="OpenRouter Error: Model not found"):
+        _send_request("http://dummy", {}, {})
+
+
+@patch("urllib.request.urlopen")
+def test_send_request_null_content_refusal(mock_urlopen: MagicMock) -> None:
+    import pytest
+    from pr_review import _send_request
+
+    mock_res = MagicMock()
+    mock_res.read.return_value = b'{"choices": [{"message": {"content": null, "refusal": "I cannot review this"}, "finish_reason": "refusal"}]}'
+    mock_urlopen.return_value.__enter__.return_value = mock_res
+
+    with pytest.raises(ValueError, match="OpenRouter Refusal: I cannot review this"):
+        _send_request("http://dummy", {}, {})
+
+
+@patch("urllib.request.urlopen")
+def test_send_request_null_content_no_refusal(mock_urlopen: MagicMock) -> None:
+    import pytest
+    from pr_review import _send_request
+
+    mock_res = MagicMock()
+    mock_res.read.return_value = b'{"choices": [{"message": {"content": null}}]}'
+    mock_urlopen.return_value.__enter__.return_value = mock_res
+
+    with pytest.raises(
+        ValueError, match="OpenRouter returned message with null content"
+    ):
+        _send_request("http://dummy", {}, {})
+
+
 @patch("pr_review._send_request")
 def test_make_openrouter_request_success(mock_send_request: MagicMock) -> None:
     from pr_review import make_openrouter_request

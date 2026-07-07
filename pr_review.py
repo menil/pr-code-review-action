@@ -132,6 +132,10 @@ def _send_request(url: str, payload: dict[str, Any], headers: dict[str, str]) ->
         with urllib.request.urlopen(req, timeout=30) as res:
             res_content = res.read(10 * 1024 * 1024).decode("utf-8", errors="replace")
             res_data = json.loads(res_content)
+            if "error" in res_data:
+                err = res_data["error"]
+                err_msg = err.get("message") if isinstance(err, dict) else str(err)
+                raise ValueError(f"OpenRouter Error: {err_msg}")
             choices = res_data.get("choices", [])
             if not choices:
                 truncated_res = (
@@ -142,7 +146,15 @@ def _send_request(url: str, payload: dict[str, Any], headers: dict[str, str]) ->
                 raise ValueError(
                     f"OpenRouter returned empty choices. Full response: {truncated_res}"
                 )
-            content = choices[0]["message"]["content"]
+            message = choices[0].get("message", {})
+            content = message.get("content")
+            if content is None:
+                refusal = message.get("refusal")
+                if refusal:
+                    raise ValueError(f"OpenRouter Refusal: {refusal}")
+                raise ValueError(
+                    f"OpenRouter returned message with null content. Full response: {res_content}"
+                )
             if not isinstance(content, str):
                 raise ValueError("OpenRouter returned non-string message content.")
             return content
