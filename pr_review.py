@@ -241,40 +241,14 @@ def make_openrouter_request(api_key: str, diff_content: str) -> str:
         "X-Title": "PR Review Bot",
     }
 
-    system_instruction = (
-        "You are an expert, constructive code reviewer. Analyze the provided pull request diff.\n"
-        "The diff lines are annotated with their line numbers in the new version of the file (e.g. '   42: + added_line' or '   43:   context_line').\n"
-        "Lines beginning with '     :' represent deleted lines and should not be commented on.\n"
-        "Generate concrete, helpful code review feedback targeting issues, bugs, and improvements.\n"
-        "CRITICAL RULES for inline comments:\n"
-        "1. ONLY comment on lines that have actual bugs, logic errors, safety/security concerns, "
-        "performance bottlenecks, or critical readability issues that require a change.\n"
-        "2. Do NOT comment on lines that are correct, well-written, or look good.\n"
-        "3. Do NOT make general observations, positive reinforcement remarks, or explain how the code works.\n"
-        "4. If a file or line is fine, do NOT generate any inline comments for it.\n"
-        "5. DO NOT print out line-by-line listings of the diff or repeat large chunks of code in your response. "
-        "This wastes tokens and causes the response to be truncated, resulting in parsing errors. "
-        "Only reference line numbers directly in the JSON response.\n"
-        '6. Ensure that all string values in the JSON response are properly escaped. Double quotes inside strings must be escaped as \\".\n\n'
-        "Group your findings into:\n"
-        "1. Critical correctness or logic bugs (edge cases, off-by-one errors).\n"
-        "2. Security vulnerabilities.\n"
-        "3. Clear performance bottlenecks.\n"
-        "4. Architectural and readability suggestions.\n\n"
-        "Respond ONLY with a JSON object. Do not wrap the JSON object in markdown code block markers. "
-        "The JSON response must match this schema exactly:\n"
-        "{\n"
-        '  "thinking": "Brief step-by-step reasoning or line identification notes (keep this concise under 200 words).",\n'
-        '  "summary": "Overall high-level markdown summary of the review findings, tables of file checks, and final recommendation.",\n'
-        '  "comments": [\n'
-        "    {\n"
-        '      "path": "file/path/here",\n'
-        '      "line": 42,\n'
-        '      "body": "Markdown string containing the specific feedback for this line. Be constructive."\n'
-        "    }\n"
-        "  ]\n"
-        "}"
-    )
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    instruction_path = os.path.join(script_dir, "system_instruction.md")
+    try:
+        with open(instruction_path, "r", encoding="utf-8") as f:
+            system_instruction = f.read()
+    except Exception as e:
+        print(f"Error reading system_instruction.md: {e}", file=sys.stderr)
+        sys.exit(1)
 
     model = os.environ.get("OPENROUTER_MODEL", "google/gemini-2.0-flash")
     try:
