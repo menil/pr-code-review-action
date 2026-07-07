@@ -1,7 +1,7 @@
 """Unit tests for the automated code review script."""
 
 from unittest.mock import MagicMock, patch
-from pr_review import get_modified_lines, parse_llm_json, truncate_diff
+from pr_review import get_modified_lines, parse_llm_json, truncate_diff, annotate_diff
 
 
 def test_get_modified_lines_single_file() -> None:
@@ -262,3 +262,67 @@ def test_make_openrouter_request_no_fallback_on_unauthorized(
     with pytest.raises(Exception, match="HTTP Error 401: Unauthorized"):
         make_openrouter_request("fake_key", "fake_diff")
     assert mock_send_request.call_count == 1
+
+
+def test_annotate_diff() -> None:
+    diff_text = """diff --git a/src/main.py b/src/main.py
+index 1234567..89abcde 100644
+--- a/src/main.py
++++ b/src/main.py
+@@ -10,6 +10,8 @@ def hello():
+  def hello():
+      print("hello")
+-     print("old")
++     print("new")
++     print("another new")
+      return True
+"""
+    annotated = annotate_diff(diff_text)
+    lines = annotated.splitlines()
+    assert "+++ b/src/main.py" in lines
+    assert "@@ -10,6 +10,8 @@ def hello():" in lines
+    assert any(line.endswith(': -     print("old")') for line in lines)
+    assert "   10:   def hello():" in lines
+    assert '   11:       print("hello")' in lines
+    assert '   12: +     print("new")' in lines
+    assert '   13: +     print("another new")' in lines
+    assert "   14:       return True" in lines
+
+
+def test_get_modified_lines_quoted_path() -> None:
+    diff_text = """diff --git a/src/my file.py b/src/my file.py
+--- a/src/my file.py
++++ "b/src/my file.py"
+@@ -1,2 +1,3 @@
+  hello
++ world
+"""
+    modified = get_modified_lines(diff_text)
+    assert "src/my file.py" in modified
+    assert modified["src/my file.py"] == {2}
+
+
+def test_parse_llm_json_trailing_commas() -> None:
+    json_str = """
+    {
+        "summary": "OK",
+        "comments": [
+            {
+                "path": "main.py",
+                "line": 5,
+                "body": "test comma",
+            },
+        ],
+    }
+    """
+    result = parse_llm_json(json_str)
+    assert result["summary"] == "OK"
+    assert len(result["comments"]) == 1
+    assert result["comments"][0]["line"] == 5
+
+
+def test_parse_llm_json_unescaped_control_chars() -> None:
+    # A JSON string containing a literal (raw) newline inside a string value.
+    raw_newline_json = '{"summary": "Line 1\nLine 2", "comments": []}'
+    result = parse_llm_json(raw_newline_json)
+    assert result["summary"] == "Line 1\nLine 2"
