@@ -187,7 +187,10 @@ def make_openrouter_request(api_key: str, diff_content: str) -> str:
         "performance bottlenecks, or critical readability issues that require a change.\n"
         "2. Do NOT comment on lines that are correct, well-written, or look good.\n"
         "3. Do NOT make general observations, positive reinforcement remarks, or explain how the code works.\n"
-        "4. If a file or line is fine, do NOT generate any inline comments for it.\n\n"
+        "4. If a file or line is fine, do NOT generate any inline comments for it.\n"
+        "5. DO NOT print out line-by-line listings of the diff or repeat large chunks of code in your response. "
+        "This wastes tokens and causes the response to be truncated, resulting in parsing errors. "
+        "Only reference line numbers directly in the JSON response.\n\n"
         "Group your findings into:\n"
         "1. Critical correctness or logic bugs (edge cases, off-by-one errors).\n"
         "2. Security vulnerabilities.\n"
@@ -196,6 +199,7 @@ def make_openrouter_request(api_key: str, diff_content: str) -> str:
         "Respond ONLY with a JSON object. Do not wrap the JSON object in markdown code block markers. "
         "The JSON response must match this schema exactly:\n"
         "{\n"
+        '  "thinking": "Brief step-by-step reasoning or line identification notes (keep this concise under 200 words).",\n'
         '  "summary": "Overall high-level markdown summary of the review findings, tables of file checks, and final recommendation.",\n'
         '  "comments": [\n'
         "    {\n"
