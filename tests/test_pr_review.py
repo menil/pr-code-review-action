@@ -352,7 +352,7 @@ def test_parse_markdown_comments() -> None:
     markdown_text = """
     We will go through the passes.
 
-    In src/app.rs:
+    In app.rs:
      - Line 81: `current_dir: start_path.canonicalize()`
        This is acceptable because...
        It should handle error.
@@ -360,7 +360,7 @@ def test_parse_markdown_comments() -> None:
      - Lines 103: self.entries = list_dir()
        This is okay.
 
-    ### src/fs.rs
+    ### Review for fs.rs
     - Line 42-44: split_name_ext
       This is a good helper function.
     """
