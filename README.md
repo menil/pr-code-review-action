@@ -74,7 +74,7 @@ jobs:
 | Input | Description | Required | Default |
 |-------|-------------|----------|---------|
 | `openrouter_api_key` | API key from OpenRouter | Yes | - |
-| `openrouter_model` | Model used for review | No | `google/gemini-2.0-flash` |
+| `openrouter_model` | Model used for review | No | `google/gemma-4-26b-a4b-it:free` |
 | `openrouter_base_url` | Base completions URL | No | `https://openrouter.ai/api/v1/chat/completions` |
 | `openrouter_max_tokens`| Max completion tokens | No | `4096` |
 | `github_token` | GitHub token for posting reviews | No | `${{ github.token }}` |
