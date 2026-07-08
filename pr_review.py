@@ -152,6 +152,108 @@ def parse_llm_json(response_text: str) -> dict[str, Any]:
     raise ValueError("No valid JSON object found in LLM response")
 
 
+def clean_markdown_line(line: str) -> str:
+    """Clean markdown markers (headers, bold, italics, backticks) from a line."""
+    line = line.strip()
+    # Strip leading '#' characters and whitespace
+    line = re.sub(r"^#+\s*", "", line)
+    # Strip bold/italic wrappers e.g. **path** or *path*
+    line = re.sub(r"^\*+\s*", "", line)
+    line = re.sub(r"\*+\s*$", "", line)
+    # Strip backticks
+    line = re.sub(r"^`\s*", "", line)
+    line = re.sub(r"`\s*$", "", line)
+    return line.strip()
+
+
+def parse_markdown_comments(
+    text: str, modified_lines: dict[str, set[int]]
+) -> list[dict[str, Any]]:
+    """Attempt to extract file, line, and comment body from free-form markdown text."""
+    comments: list[dict[str, Any]] = []
+    current_file: str | None = None
+    current_comment: dict[str, Any] | None = None
+
+    # Pattern for line numbers
+    # Matches:
+    # "Line 81: ...", "Lines 42-59: ...", "[Line 81]: ...", "(Line 81) - ..."
+    # Case insensitive, optional brackets/parentheses, optional whitespace, colon or hyphen separator
+    line_re = re.compile(
+        r"^\s*[-*]?\s*[\(\[]?[lL]ines?\s+(\d+)(?:\s*-\s*(\d+))?[\)\]]?\s*[:\-]\s*(.*)$"
+    )
+
+    for line in text.splitlines():
+        cleaned = clean_markdown_line(line)
+        if not cleaned:
+            if current_comment:
+                current_comment["body"] += "\n"
+            continue
+
+        # Check if line indicates a file path from modified_lines
+        found_file = False
+        for path in modified_lines:
+            # Matches header patterns like:
+            # - "In src/app.rs:" or "In src/app.rs"
+            # - "File: src/app.rs"
+            # - exactly "src/app.rs"
+            # - "### src/app.rs"
+            norm_path = path.lower()
+            cleaned_lower = cleaned.lower()
+            if (
+                cleaned_lower == norm_path
+                or cleaned_lower == f"in {norm_path}:"
+                or cleaned_lower == f"in {norm_path}"
+                or cleaned_lower == f"file: {norm_path}"
+                or cleaned_lower == f"file {norm_path}"
+                or cleaned_lower.startswith(f"### {norm_path}")
+                or cleaned_lower.startswith(f"## {norm_path}")
+                or cleaned_lower.startswith(f"in ` {norm_path} `")
+                or cleaned_lower.startswith(f"in `{norm_path}`")
+            ):
+                current_file = path
+                found_file = True
+                if current_comment:
+                    comments.append(current_comment)
+                    current_comment = None
+                break
+
+        if found_file:
+            continue
+
+        # Check if it's a line comment start
+        line_match = line_re.match(line)
+        if line_match and current_file:
+            if current_comment:
+                comments.append(current_comment)
+            start_line = int(line_match.group(1))
+            end_line_str = line_match.group(2)
+            end_line = int(end_line_str) if end_line_str else start_line
+            initial_text = line_match.group(3).strip()
+
+            current_comment = {
+                "path": current_file,
+                "line": end_line,
+                "body": initial_text,
+            }
+            continue
+
+        # If we are inside a comment, append the text
+        if current_comment:
+            if current_comment["body"]:
+                current_comment["body"] += "\n" + line
+            else:
+                current_comment["body"] = line
+
+    if current_comment:
+        comments.append(current_comment)
+
+    # Post-process: clean up trailing/leading newlines and whitespace
+    for c in comments:
+        c["body"] = c["body"].strip()
+
+    return comments
+
+
 def truncate_diff(diff_content: str, limit: int = 500000) -> str:
     """Truncate the diff content at the last newline character before the limit."""
     if len(diff_content) > limit:
@@ -250,7 +352,7 @@ def make_openrouter_request(api_key: str, diff_content: str) -> str:
         print(f"Error reading system_instruction.md: {e}", file=sys.stderr)
         sys.exit(1)
 
-    model = os.environ.get("OPENROUTER_MODEL", "google/gemini-2.0-flash")
+    model = os.environ.get("OPENROUTER_MODEL", "openrouter/free")
     try:
         max_tokens = int(os.environ.get("OPENROUTER_MAX_TOKENS", "4096"))
     except ValueError:
@@ -340,6 +442,8 @@ def main() -> None:
     pr_number = os.environ.get("PR_NUMBER")
     repo = os.environ.get("REPO")
     token = os.environ.get("GH_TOKEN")
+    post_summary_env = os.environ.get("POST_SUMMARY", "true")
+    post_summary = post_summary_env.lower() in ("true", "1", "yes")
 
     if not api_key:
         print(
@@ -381,6 +485,7 @@ def main() -> None:
         print(f"Error: API request failed: {e}", file=sys.stderr)
         sys.exit(1)
 
+    json_parsed = False
     try:
         review_data = parse_llm_json(raw_response)
         summary = review_data.get("summary", "Automated code review completed.")
@@ -389,21 +494,15 @@ def main() -> None:
         llm_comments = review_data.get("comments", [])
         if not isinstance(llm_comments, list):
             llm_comments = []
+        json_parsed = True
     except Exception as e:
         print(
             f"Warning: Failed to parse structured JSON from LLM review: {e}. "
-            "Falling back to posting raw response in summary.",
+            "Attempting to parse comments from free-form markdown text...",
             file=sys.stderr,
         )
-        summary = f"### Automated PR Review Summary\n\n{raw_response}"
-        llm_comments = []
-
-    if is_truncated:
-        summary += (
-            "\n\n> [!WARNING]\n> **Note**: The pull request diff was truncated "
-            "because it exceeded the size limit (500KB). Some changes or files "
-            "might not have been fully reviewed."
-        )
+        llm_comments = parse_markdown_comments(raw_response, modified_lines)
+        summary = "Automated code review completed (JSON parsing failed, fallback comments parsed)."
 
     print(f"Filtering {len(llm_comments)} suggested comments against modified lines...")
     valid_comments = []
@@ -443,8 +542,32 @@ def main() -> None:
         else:
             print(f"Skipped comment targeting unchanged line: {path}:{line}")
 
+    # Build the final review body depending on post_summary and json_parsed
+    if not post_summary:
+        if valid_comments:
+            final_body = f"Automated code review completed. Posted {len(valid_comments)} inline comment(s) on specific lines."
+        else:
+            final_body = "Automated code review completed. No issues found."
+    else:
+        if json_parsed:
+            final_body = summary
+        else:
+            final_body = (
+                "Automated code review completed.\n\n"
+                "> [!NOTE]\n"
+                "> The structured code review summary could not be parsed as a JSON object, "
+                "but inline comments were successfully extracted from the review response."
+            )
+
+    if is_truncated and post_summary:
+        final_body += (
+            "\n\n> [!WARNING]\n> **Note**: The pull request diff was truncated "
+            "because it exceeded the size limit (500KB). Some changes or files "
+            "might not have been fully reviewed."
+        )
+
     print(f"Submitting review to GitHub with {len(valid_comments)} inline comments...")
-    submit_github_review(repo, pr_number, token, summary, valid_comments)
+    submit_github_review(repo, pr_number, token, final_body, valid_comments)
 
 
 if __name__ == "__main__":
