@@ -192,23 +192,32 @@ def parse_markdown_comments(
         # Check if line indicates a file path from modified_lines
         found_file = False
         for path in modified_lines:
-            # Matches header patterns like:
-            # - "In src/app.rs:" or "In src/app.rs"
-            # - "File: src/app.rs"
-            # - exactly "src/app.rs"
-            # - "### src/app.rs"
             norm_path = path.lower()
+            basename = os.path.basename(path).lower()
             cleaned_lower = cleaned.lower()
-            if (
-                cleaned_lower == norm_path
-                or cleaned_lower == f"in {norm_path}:"
-                or cleaned_lower == f"in {norm_path}"
-                or cleaned_lower == f"file: {norm_path}"
-                or cleaned_lower == f"file {norm_path}"
-                or cleaned_lower.startswith(f"### {norm_path}")
-                or cleaned_lower.startswith(f"## {norm_path}")
-                or cleaned_lower.startswith(f"in ` {norm_path} `")
-                or cleaned_lower.startswith(f"in `{norm_path}`")
+
+            patterns = [
+                norm_path,
+                basename,
+                f"in {norm_path}",
+                f"in {basename}",
+                f"file: {norm_path}",
+                f"file: {basename}",
+                f"file {norm_path}",
+                f"file {basename}",
+                f"review of {norm_path}",
+                f"review of {basename}",
+                f"review for {norm_path}",
+                f"review for {basename}",
+                f"review {norm_path}",
+                f"review {basename}",
+            ]
+
+            cleaned_pat = cleaned_lower.rstrip(":").strip()
+
+            if cleaned_pat in patterns or (
+                (cleaned_lower.startswith("###") or cleaned_lower.startswith("##"))
+                and (norm_path in cleaned_lower or basename in cleaned_lower)
             ):
                 current_file = path
                 found_file = True
@@ -501,6 +510,9 @@ def main() -> None:
             "Attempting to parse comments from free-form markdown text...",
             file=sys.stderr,
         )
+        print("--- RAW LLM RESPONSE START ---", file=sys.stderr)
+        print(raw_response, file=sys.stderr)
+        print("--- RAW LLM RESPONSE END ---", file=sys.stderr)
         llm_comments = parse_markdown_comments(raw_response, modified_lines)
         summary = "Automated code review completed (JSON parsing failed, fallback comments parsed)."
 
@@ -566,8 +578,22 @@ def main() -> None:
             "might not have been fully reviewed."
         )
 
-    print(f"Submitting review to GitHub with {len(valid_comments)} inline comments...")
-    submit_github_review(repo, pr_number, token, final_body, valid_comments)
+    # Decide if we should submit a review to GitHub
+    should_submit = False
+    if valid_comments:
+        should_submit = True
+    elif post_summary and json_parsed:
+        should_submit = True
+
+    if should_submit:
+        print(
+            f"Submitting review to GitHub with {len(valid_comments)} inline comments..."
+        )
+        submit_github_review(repo, pr_number, token, final_body, valid_comments)
+    else:
+        print(
+            "No inline comments and no review summary to post. Skipping GitHub review submission."
+        )
 
 
 if __name__ == "__main__":
