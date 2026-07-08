@@ -110,7 +110,7 @@ def test_truncate_diff() -> None:
     assert "truncated" in truncated_no_nl
 
 
-@patch("urllib.request.urlopen")
+@patch("pr_review.urllib.request.urlopen")
 def test_send_request_success(mock_urlopen: MagicMock) -> None:
     import json
     import urllib.request
@@ -135,7 +135,7 @@ def test_send_request_success(mock_urlopen: MagicMock) -> None:
     assert kwargs.get("timeout") == 30
 
 
-@patch("urllib.request.urlopen")
+@patch("pr_review.urllib.request.urlopen")
 def test_send_request_empty_choices(mock_urlopen: MagicMock) -> None:
     import pytest
     from pr_review import _send_request
@@ -148,7 +148,7 @@ def test_send_request_empty_choices(mock_urlopen: MagicMock) -> None:
         _send_request("http://dummy", {}, {})
 
 
-@patch("urllib.request.urlopen")
+@patch("pr_review.urllib.request.urlopen")
 def test_send_request_non_string_content(mock_urlopen: MagicMock) -> None:
     import pytest
     from pr_review import _send_request
@@ -163,7 +163,7 @@ def test_send_request_non_string_content(mock_urlopen: MagicMock) -> None:
         _send_request("http://dummy", {}, {})
 
 
-@patch("urllib.request.urlopen")
+@patch("pr_review.urllib.request.urlopen")
 def test_send_request_error_response(mock_urlopen: MagicMock) -> None:
     import pytest
     from pr_review import _send_request
@@ -178,7 +178,7 @@ def test_send_request_error_response(mock_urlopen: MagicMock) -> None:
         _send_request("http://dummy", {}, {})
 
 
-@patch("urllib.request.urlopen")
+@patch("pr_review.urllib.request.urlopen")
 def test_send_request_null_content_refusal(mock_urlopen: MagicMock) -> None:
     import pytest
     from pr_review import _send_request
@@ -191,7 +191,7 @@ def test_send_request_null_content_refusal(mock_urlopen: MagicMock) -> None:
         _send_request("http://dummy", {}, {})
 
 
-@patch("urllib.request.urlopen")
+@patch("pr_review.urllib.request.urlopen")
 def test_send_request_null_content_no_refusal(mock_urlopen: MagicMock) -> None:
     import pytest
     from pr_review import _send_request
@@ -404,3 +404,304 @@ def test_parse_markdown_comments() -> None:
     assert c3["path"] == "src/fs.rs"
     assert c3["line"] == 44
     assert "This is a good helper function." in c3["body"]
+
+
+@patch("time.sleep")
+@patch("pr_review.urllib.request.urlopen")
+def test_send_request_retry_on_429_then_success(
+    mock_urlopen: MagicMock, mock_sleep: MagicMock
+) -> None:
+    import urllib.error
+    from pr_review import _send_request
+
+    # First attempt raises HTTPError 429
+    mock_headers = MagicMock()
+    mock_headers.get.return_value = "5"  # Retry-After header
+
+    # We need an HTTPError mock
+    err_body = b'{"error": {"message": "Rate limited", "metadata": {"retry_after_seconds": 10}}}'
+    fp = MagicMock()
+    fp.read.return_value = err_body
+
+    http_err = urllib.error.HTTPError(
+        "http://dummy", 429, "Too Many Requests", mock_headers, fp
+    )
+
+    # Second attempt succeeds
+    mock_res = MagicMock()
+    mock_res.__enter__.return_value = mock_res
+    mock_res.read.return_value = b'{"choices": [{"message": {"content": "Success"}}]}'
+
+    # Set side effect
+    mock_urlopen.side_effect = [http_err, mock_res]
+
+    content = _send_request("http://dummy", {}, {})
+    assert content == "Success"
+    assert mock_urlopen.call_count == 2
+    mock_sleep.assert_called_once()
+    # Check that sleep duration was at least the retry_after value
+    sleep_args, _ = mock_sleep.call_args
+    assert sleep_args[0] >= 10.0
+
+
+@patch("time.sleep")
+@patch("pr_review.urllib.request.urlopen")
+def test_send_request_retry_on_network_error_then_success(
+    mock_urlopen: MagicMock, mock_sleep: MagicMock
+) -> None:
+    from pr_review import _send_request
+    import urllib.error
+
+    # First attempt raises URLError
+    url_err = urllib.error.URLError("DNS resolution failed")
+
+    # Second attempt succeeds
+    mock_res = MagicMock()
+    mock_res.__enter__.return_value = mock_res
+    mock_res.read.return_value = (
+        b'{"choices": [{"message": {"content": "Success Network"}}]}'
+    )
+
+    mock_urlopen.side_effect = [url_err, mock_res]
+
+    content = _send_request("http://dummy", {}, {})
+    assert content == "Success Network"
+    assert mock_urlopen.call_count == 2
+    mock_sleep.assert_called_once()
+
+
+@patch("time.sleep")
+@patch("pr_review.urllib.request.urlopen")
+def test_send_request_rate_limit_in_json_body_then_success(
+    mock_urlopen: MagicMock, mock_sleep: MagicMock
+) -> None:
+    from pr_review import _send_request
+
+    # First attempt returns 200 OK but with error in JSON payload
+    mock_res_err = MagicMock()
+    mock_res_err.__enter__.return_value = mock_res_err
+    mock_res_err.read.return_value = b'{"error": {"message": "Rate limit reached", "code": 429, "metadata": {"retry_after_seconds": 3}}}'
+
+    # Second attempt succeeds
+    mock_res_ok = MagicMock()
+    mock_res_ok.__enter__.return_value = mock_res_ok
+    mock_res_ok.read.return_value = (
+        b'{"choices": [{"message": {"content": "Success JSON"}}]}'
+    )
+
+    mock_urlopen.side_effect = [mock_res_err, mock_res_ok]
+
+    content = _send_request("http://dummy", {}, {})
+    assert content == "Success JSON"
+    assert mock_urlopen.call_count == 2
+    mock_sleep.assert_called_once()
+    sleep_args, _ = mock_sleep.call_args
+    assert sleep_args[0] >= 3.0
+
+
+@patch("time.sleep")
+@patch("pr_review.urllib.request.urlopen")
+def test_send_request_max_retries_exhausted(
+    mock_urlopen: MagicMock, mock_sleep: MagicMock
+) -> None:
+    import pytest
+    import urllib.error
+    from pr_review import _send_request
+
+    # Always raise URLError
+    mock_urlopen.side_effect = urllib.error.URLError("Connection timed out")
+
+    with pytest.raises(urllib.error.URLError, match="Connection timed out"):
+        _send_request("http://dummy", {}, {})
+
+    # 1 initial attempt + 5 retries = 6 calls total
+    assert mock_urlopen.call_count == 6
+    assert mock_sleep.call_count == 5
+
+
+@patch("time.sleep")
+@patch("pr_review.urllib.request.urlopen")
+def test_send_request_stale_error_body_bug(
+    mock_urlopen: MagicMock, mock_sleep: MagicMock
+) -> None:
+    import pytest
+    import urllib.error
+    from pr_review import _send_request
+
+    # First attempt raises HTTPError 429 (retryable)
+    mock_headers_429 = MagicMock()
+    fp_429 = MagicMock()
+    fp_429.read.return_value = b"Rate limit details"
+    err_429 = urllib.error.HTTPError(
+        "http://dummy", 429, "Too Many Requests", mock_headers_429, fp_429
+    )
+
+    # Second attempt raises HTTPError 400 (non-retryable)
+    mock_headers_400 = MagicMock()
+    fp_400 = MagicMock()
+    fp_400.read.return_value = b"Bad Request details"
+    err_400 = urllib.error.HTTPError(
+        "http://dummy", 400, "Bad Request", mock_headers_400, fp_400
+    )
+
+    mock_urlopen.side_effect = [err_429, err_400]
+
+    with pytest.raises(ValueError) as excinfo:
+        _send_request("http://dummy", {}, {})
+
+    assert "HTTP Error 400: Bad Request details" in str(excinfo.value)
+
+
+@patch("time.sleep")
+@patch("pr_review.urllib.request.urlopen")
+def test_send_request_retry_on_503_then_success(
+    mock_urlopen: MagicMock, mock_sleep: MagicMock
+) -> None:
+    import urllib.error
+    from pr_review import _send_request
+
+    # First attempt raises HTTPError 503 (retryable)
+    mock_headers = MagicMock()
+    fp = MagicMock()
+    fp.read.return_value = b"Service Unavailable"
+    http_err_503 = urllib.error.HTTPError(
+        "http://dummy", 503, "Service Unavailable", mock_headers, fp
+    )
+
+    # Second attempt succeeds
+    mock_res = MagicMock()
+    mock_res.__enter__.return_value = mock_res
+    mock_res.read.return_value = (
+        b'{"choices": [{"message": {"content": "Success 503"}}]}'
+    )
+
+    mock_urlopen.side_effect = [http_err_503, mock_res]
+
+    content = _send_request("http://dummy", {}, {})
+    assert content == "Success 503"
+    assert mock_urlopen.call_count == 2
+    mock_sleep.assert_called_once()
+
+
+@patch("time.sleep")
+@patch("pr_review.urllib.request.urlopen")
+def test_send_request_retry_after_header_only_then_success(
+    mock_urlopen: MagicMock, mock_sleep: MagicMock
+) -> None:
+    import urllib.error
+    from pr_review import _send_request
+
+    # First attempt raises HTTPError 429 with Retry-After header, no body metadata
+    mock_headers = MagicMock()
+    mock_headers.get.side_effect = lambda name, default=None: (
+        "15" if name == "Retry-After" else default
+    )
+    fp = MagicMock()
+    fp.read.return_value = b""  # empty/invalid JSON body
+    http_err = urllib.error.HTTPError(
+        "http://dummy", 429, "Too Many Requests", mock_headers, fp
+    )
+
+    # Second attempt succeeds
+    mock_res = MagicMock()
+    mock_res.__enter__.return_value = mock_res
+    mock_res.read.return_value = (
+        b'{"choices": [{"message": {"content": "Success Header"}}]}'
+    )
+
+    mock_urlopen.side_effect = [http_err, mock_res]
+
+    content = _send_request("http://dummy", {}, {})
+    assert content == "Success Header"
+    assert mock_urlopen.call_count == 2
+    mock_sleep.assert_called_once()
+    sleep_args, _ = mock_sleep.call_args
+    assert sleep_args[0] >= 15.0
+
+
+@patch("time.sleep")
+@patch("pr_review.urllib.request.urlopen")
+def test_send_request_retry_after_invalid_header_then_success(
+    mock_urlopen: MagicMock, mock_sleep: MagicMock
+) -> None:
+    import urllib.error
+    from pr_review import _send_request
+
+    # First attempt raises HTTPError 429 with invalid Retry-After header
+    mock_headers = MagicMock()
+    mock_headers.get.side_effect = lambda name, default=None: (
+        "invalid_delay" if name == "Retry-After" else default
+    )
+    fp = MagicMock()
+    fp.read.return_value = b""
+    http_err = urllib.error.HTTPError(
+        "http://dummy", 429, "Too Many Requests", mock_headers, fp
+    )
+
+    # Second attempt succeeds
+    mock_res = MagicMock()
+    mock_res.__enter__.return_value = mock_res
+    mock_res.read.return_value = (
+        b'{"choices": [{"message": {"content": "Success Invalid Header"}}]}'
+    )
+
+    mock_urlopen.side_effect = [http_err, mock_res]
+
+    content = _send_request("http://dummy", {}, {})
+    assert content == "Success Invalid Header"
+    assert mock_urlopen.call_count == 2
+    mock_sleep.assert_called_once()
+    sleep_args, _ = mock_sleep.call_args
+    assert sleep_args[0] >= 1.0  # base_delay is 1.0
+
+
+@patch("time.sleep")
+@patch("pr_review.urllib.request.urlopen")
+def test_send_request_http_error_exhausted(
+    mock_urlopen: MagicMock, mock_sleep: MagicMock
+) -> None:
+    import pytest
+    import urllib.error
+    from pr_review import _send_request
+
+    # Always raise HTTPError 500
+    mock_headers = MagicMock()
+    fp = MagicMock()
+    fp.read.return_value = b"Internal Server Error"
+    http_err = urllib.error.HTTPError(
+        "http://dummy", 500, "Internal Server Error", mock_headers, fp
+    )
+    mock_urlopen.side_effect = http_err
+
+    with pytest.raises(ValueError) as excinfo:
+        _send_request("http://dummy", {}, {})
+
+    assert "OpenRouter HTTP Error 500: Internal Server Error" in str(excinfo.value)
+    # 1 initial + 5 retries = 6 attempts total
+    assert mock_urlopen.call_count == 6
+    assert mock_sleep.call_count == 5
+
+
+@patch("time.sleep")
+@patch("pr_review.urllib.request.urlopen")
+def test_send_request_timeout_error_then_success(
+    mock_urlopen: MagicMock, mock_sleep: MagicMock
+) -> None:
+    from pr_review import _send_request
+
+    # First attempt raises TimeoutError
+    time_err = TimeoutError("Request timed out")
+
+    # Second attempt succeeds
+    mock_res = MagicMock()
+    mock_res.__enter__.return_value = mock_res
+    mock_res.read.return_value = (
+        b'{"choices": [{"message": {"content": "Success Timeout"}}]}'
+    )
+
+    mock_urlopen.side_effect = [time_err, mock_res]
+
+    content = _send_request("http://dummy", {}, {})
+    assert content == "Success Timeout"
+    assert mock_urlopen.call_count == 2
+    mock_sleep.assert_called_once()

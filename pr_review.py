@@ -8,8 +8,10 @@ only changed lines, and submits the review to GitHub.
 
 import json
 import os
+import random
 import re
 import sys
+import time
 from typing import Any
 import urllib.error
 import urllib.request
@@ -283,6 +285,24 @@ def truncate_diff(diff_content: str, limit: int = 500000) -> str:
     return diff_content
 
 
+def _calculate_backoff(
+    attempt: int, base_delay: float, retry_after: str | float | int | None = None
+) -> float:
+    """Calculate jittered exponential backoff delay, respecting optional retry-after metadata.
+
+    Jittered exponential backoff prevents synchronized retry thundering herds.
+    """
+    delay = base_delay * (2**attempt) + random.uniform(0.1, 1.0)
+    if retry_after is not None:
+        try:
+            # Respect the provider's suggested wait time if it is longer than our backoff
+            delay = max(delay, float(retry_after))
+        except (ValueError, TypeError):
+            pass
+    # Cap the maximum delay to prevent excessively long blocks in automated workflows
+    return float(min(delay, 60.0))
+
+
 def _send_request(url: str, payload: dict[str, Any], headers: dict[str, str]) -> str:
     """Send HTTP request to OpenRouter and handle errors/timeouts.
 
@@ -295,48 +315,132 @@ def _send_request(url: str, payload: dict[str, Any], headers: dict[str, str]) ->
         The raw text content returned in the model's chat completion choice.
 
     Raises:
-        ValueError: If the response is empty, malformed, or missing message content.
-        urllib.error.HTTPError: If the server returns a non-2xx status code.
+        ValueError: If the response is empty, malformed, missing message content, or on HTTPError.
+        urllib.error.URLError: If connection/DNS resolution fails and retries are exhausted.
+        TimeoutError: If request times out and retries are exhausted.
     """
-    req = urllib.request.Request(
-        url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST"
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as res:
-            res_content = res.read(10 * 1024 * 1024).decode("utf-8", errors="replace")
-            res_data = json.loads(res_content)
-            if "error" in res_data:
-                err = res_data["error"]
-                err_msg = err.get("message") if isinstance(err, dict) else str(err)
-                raise ValueError(f"OpenRouter Error: {err_msg}")
-            choices = res_data.get("choices", [])
-            if not choices:
-                truncated_res = (
-                    res_content[:1000] + "..."
-                    if len(res_content) > 1000
-                    else res_content
-                )
-                raise ValueError(
-                    f"OpenRouter returned empty choices. Full response: {truncated_res}"
-                )
-            message = choices[0].get("message", {})
-            content = message.get("content")
-            if content is None:
-                refusal = message.get("refusal")
-                if refusal:
-                    raise ValueError(f"OpenRouter Refusal: {refusal}")
-                raise ValueError(
-                    f"OpenRouter returned message with null content. Full response: {res_content}"
-                )
-            if not isinstance(content, str):
-                raise ValueError("OpenRouter returned non-string message content.")
-            return content
-    except urllib.error.HTTPError as e:
+    max_retries = 5
+    base_delay = 1.0
+
+    # Serialize and encode payload once outside the retry loop for performance
+    data = json.dumps(payload).encode("utf-8")
+
+    for attempt in range(max_retries + 1):
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
         try:
-            err_body = e.read().decode("utf-8", errors="replace")
-        except Exception:
-            err_body = "<could not read HTTP error body>"
-        raise ValueError(f"OpenRouter HTTP Error {e.code}: {err_body}") from e
+            with urllib.request.urlopen(req, timeout=30) as res:
+                res_content = res.read(10 * 1024 * 1024).decode(
+                    "utf-8", errors="replace"
+                )
+                res_data = json.loads(res_content)
+                if isinstance(res_data, dict) and "error" in res_data:
+                    err = res_data["error"]
+                    err_msg = (
+                        str(err.get("message") or "")
+                        if isinstance(err, dict)
+                        else str(err)
+                    )
+                    err_code = err.get("code") if isinstance(err, dict) else None
+
+                    # Some API providers return rate-limit info in the JSON response body
+                    # with HTTP 200 rather than as an HTTP 429 status code.
+                    if (
+                        err_code == 429 or "rate limit" in err_msg.lower()
+                    ) and attempt < max_retries:
+                        retry_after = None
+                        if isinstance(err, dict):
+                            metadata = err.get("metadata")
+                            if isinstance(metadata, dict):
+                                retry_after = metadata.get("retry_after_seconds")
+
+                        delay = _calculate_backoff(attempt, base_delay, retry_after)
+                        print(
+                            f"Rate limited by API error. Retrying in {delay:.2f} seconds...",
+                            file=sys.stderr,
+                        )
+                        time.sleep(delay)
+                        continue
+
+                    raise ValueError(f"OpenRouter Error: {err_msg}")
+
+                choices = res_data.get("choices", [])
+                if not choices:
+                    truncated_res = (
+                        res_content[:1000] + "..."
+                        if len(res_content) > 1000
+                        else res_content
+                    )
+                    raise ValueError(
+                        f"OpenRouter returned empty choices. Full response: {truncated_res}"
+                    )
+                message = choices[0].get("message", {})
+                content = message.get("content")
+                if content is None:
+                    refusal = message.get("refusal")
+                    if refusal:
+                        raise ValueError(f"OpenRouter Refusal: {refusal}")
+                    raise ValueError(
+                        f"OpenRouter returned message with null content. Full response: {res_content}"
+                    )
+                if not isinstance(content, str):
+                    raise ValueError("OpenRouter returned non-string message content.")
+                return content
+        except urllib.error.HTTPError as e:
+            # Read the error body eagerly once to avoid stream exhaustion issues on retry/raise paths
+            try:
+                err_body = e.read(1024 * 1024).decode("utf-8", errors="replace")
+            except Exception:
+                err_body = ""
+
+            # Only retry transient errors (429 rate limit or 5xx server errors).
+            # Permanent errors (e.g. 400 Bad Request, 401 Unauthorized, 403 Forbidden) fail immediately.
+            is_retryable = e.code == 429 or (500 <= e.code < 600)
+            if is_retryable and attempt < max_retries:
+                retry_after = e.headers.get("Retry-After")
+
+                # Attempt to parse body metadata for specific retry details in case standard header is not populated
+                if err_body:
+                    try:
+                        err_data = json.loads(err_body)
+                        if isinstance(err_data, dict):
+                            err_info = err_data.get("error")
+                            if isinstance(err_info, dict):
+                                metadata = err_info.get("metadata")
+                                if isinstance(metadata, dict):
+                                    body_retry_after = metadata.get(
+                                        "retry_after_seconds"
+                                    )
+                                    if body_retry_after is not None:
+                                        retry_after = body_retry_after
+                    except Exception:
+                        pass
+
+                delay = _calculate_backoff(attempt, base_delay, retry_after)
+                print(
+                    f"API request failed with status {e.code}. Retrying in {delay:.2f} seconds...",
+                    file=sys.stderr,
+                )
+                time.sleep(delay)
+                continue
+            else:
+                if not err_body:
+                    err_body = "<could not read HTTP error body>"
+                raise ValueError(f"OpenRouter HTTP Error {e.code}: {err_body}") from e
+        except (urllib.error.URLError, TimeoutError) as e:
+            # Network drops and timeouts are transient issues; retry them
+            if attempt < max_retries:
+                delay = _calculate_backoff(attempt, base_delay)
+                print(
+                    f"API request network/timeout error: {e}. Retrying in {delay:.2f} seconds...",
+                    file=sys.stderr,
+                )
+                time.sleep(delay)
+                continue
+            else:
+                # Propagate connection errors once max retries are exhausted
+                raise
+
+    raise ValueError("API request failed: retries exhausted.")
 
 
 def make_openrouter_request(
