@@ -339,7 +339,9 @@ def _send_request(url: str, payload: dict[str, Any], headers: dict[str, str]) ->
         raise ValueError(f"OpenRouter HTTP Error {e.code}: {err_body}") from e
 
 
-def make_openrouter_request(api_key: str, diff_content: str) -> str:
+def make_openrouter_request(
+    api_key: str, diff_content: str, post_summary: bool = True
+) -> str:
     """Call OpenRouter API to review the diff content using Gemini 2.0 Flash."""
     url = os.environ.get(
         "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1/chat/completions"
@@ -353,12 +355,17 @@ def make_openrouter_request(api_key: str, diff_content: str) -> str:
     }
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    instruction_path = os.path.join(script_dir, "system_instruction.md")
+    instruction_file = (
+        "system_instruction.md"
+        if post_summary
+        else "system_instruction_comments_only.md"
+    )
+    instruction_path = os.path.join(script_dir, instruction_file)
     try:
         with open(instruction_path, "r", encoding="utf-8") as f:
             system_instruction = f.read()
     except Exception as e:
-        print(f"Error reading system_instruction.md: {e}", file=sys.stderr)
+        print(f"Error reading {instruction_file}: {e}", file=sys.stderr)
         sys.exit(1)
 
     model = os.environ.get("OPENROUTER_MODEL", "openrouter/free")
@@ -489,7 +496,7 @@ def main() -> None:
 
     print("Requesting review from OpenRouter...")
     try:
-        raw_response = make_openrouter_request(api_key, diff_content)
+        raw_response = make_openrouter_request(api_key, diff_content, post_summary)
     except Exception as e:
         print(f"Error: API request failed: {e}", file=sys.stderr)
         sys.exit(1)
@@ -583,6 +590,9 @@ def main() -> None:
     if valid_comments:
         should_submit = True
     elif post_summary and json_parsed:
+        should_submit = True
+    elif not post_summary:
+        # Always submit review when post_summary is False so the user knows it ran
         should_submit = True
 
     if should_submit:
