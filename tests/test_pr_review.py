@@ -1,7 +1,14 @@
 """Unit tests for the automated code review script."""
 
 from unittest.mock import MagicMock, patch
-from pr_review import get_modified_lines, parse_llm_json, truncate_diff, annotate_diff
+from pr_review import (
+    get_modified_lines,
+    parse_llm_json,
+    truncate_diff,
+    annotate_diff,
+    clean_markdown_line,
+    parse_markdown_comments,
+)
 
 
 def test_get_modified_lines_single_file() -> None:
@@ -326,3 +333,53 @@ def test_parse_llm_json_unescaped_control_chars() -> None:
     raw_newline_json = '{"summary": "Line 1\nLine 2", "comments": []}'
     result = parse_llm_json(raw_newline_json)
     assert result["summary"] == "Line 1\nLine 2"
+
+
+def test_clean_markdown_line() -> None:
+    assert clean_markdown_line("### src/app.rs") == "src/app.rs"
+    assert clean_markdown_line("In src/app.rs:") == "In src/app.rs:"
+    assert clean_markdown_line("**src/app.rs**") == "src/app.rs"
+    assert clean_markdown_line("`src/app.rs`") == "src/app.rs"
+    assert clean_markdown_line("   ###  `src/app.rs`  ") == "src/app.rs"
+
+
+def test_parse_markdown_comments() -> None:
+    modified_lines = {
+        "src/app.rs": {81, 103, 112},
+        "src/fs.rs": {42, 43, 44},
+    }
+
+    markdown_text = """
+    We will go through the passes.
+
+    In src/app.rs:
+     - Line 81: `current_dir: start_path.canonicalize()`
+       This is acceptable because...
+       It should handle error.
+
+     - Lines 103: self.entries = list_dir()
+       This is okay.
+
+    ### src/fs.rs
+    - Line 42-44: split_name_ext
+      This is a good helper function.
+    """
+
+    comments = parse_markdown_comments(markdown_text, modified_lines)
+    assert len(comments) == 3
+
+    c1 = comments[0]
+    assert c1["path"] == "src/app.rs"
+    assert c1["line"] == 81
+    assert "This is acceptable because" in c1["body"]
+    assert "It should handle error." in c1["body"]
+
+    c2 = comments[1]
+    assert c2["path"] == "src/app.rs"
+    assert c2["line"] == 103
+    assert c2["body"] == "self.entries = list_dir()\n       This is okay."
+
+    c3 = comments[2]
+    assert c3["path"] == "src/fs.rs"
+    assert c3["line"] == 44
+    assert "This is a good helper function." in c3["body"]
