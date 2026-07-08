@@ -12,7 +12,7 @@ inputs:
   openrouter_model:
     description: 'Model to use for code review'
     required: false
-    default: 'openrouter/free'
+    default: 'google/gemma-4-26b-a4b-it:free'
   openrouter_base_url:
     description: 'Base URL for OpenRouter completions API'
     required: false
