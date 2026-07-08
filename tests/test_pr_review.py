@@ -222,6 +222,27 @@ def test_make_openrouter_request_success(mock_send_request: MagicMock) -> None:
 
 
 @patch("pr_review._send_request")
+def test_make_openrouter_request_comments_only(
+    mock_send_request: MagicMock,
+) -> None:
+    from pr_review import make_openrouter_request
+
+    mock_send_request.return_value = '{"comments": []}'
+
+    result = make_openrouter_request("fake_key", "fake_diff", post_summary=False)
+
+    assert result == '{"comments": []}'
+    mock_send_request.assert_called_once()
+    args, kwargs = mock_send_request.call_args
+    payload = args[1]
+    assert payload["response_format"] == {"type": "json_object"}
+    system_msg = payload["messages"][0]["content"]
+    # Check that it uses the simplified instruction file
+    assert "comments" in system_msg
+    assert "thinking" not in system_msg
+
+
+@patch("pr_review._send_request")
 def test_make_openrouter_request_fallback_success(mock_send_request: MagicMock) -> None:
     from pr_review import make_openrouter_request
 
