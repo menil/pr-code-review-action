@@ -499,7 +499,12 @@ def make_openrouter_request(
         return _send_request(url, payload, headers)
     except Exception as e:
         err_msg = str(e)
-        if "HTTP Error 400" in err_msg or "HTTP Error 422" in err_msg:
+        is_json_error = (
+            "HTTP Error 400" in err_msg
+            or "HTTP Error 422" in err_msg
+            or isinstance(e, ValueError)
+        )
+        if is_json_error:
             print(
                 f"Warning: JSON-mode request failed: {e}. Retrying without strict JSON format constraint...",
                 file=sys.stderr,
