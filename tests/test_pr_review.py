@@ -379,6 +379,11 @@ def test_clean_markdown_line() -> None:
     assert clean_markdown_line("**src/app.rs**") == "src/app.rs"
     assert clean_markdown_line("`src/app.rs`") == "src/app.rs"
     assert clean_markdown_line("   ###  `src/app.rs`  ") == "src/app.rs"
+    assert clean_markdown_line("- In src/app.rs:") == "In src/app.rs:"
+    assert clean_markdown_line("* In src/app.rs:") == "In src/app.rs:"
+    assert clean_markdown_line("+ In src/app.rs:") == "In src/app.rs:"
+    assert clean_markdown_line("1. In src/app.rs:") == "In src/app.rs:"
+    assert clean_markdown_line("12. In src/app.rs:") == "In src/app.rs:"
 
 
 def test_parse_markdown_comments() -> None:
@@ -390,7 +395,7 @@ def test_parse_markdown_comments() -> None:
     markdown_text = """
     We will go through the passes.
 
-    In app.rs:
+    - In app.rs:
      - Line 81: `current_dir: start_path.canonicalize()`
        This is acceptable because...
        It should handle error.
