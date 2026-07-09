@@ -159,6 +159,9 @@ def clean_markdown_line(line: str) -> str:
     line = line.strip()
     # Strip leading '#' characters and whitespace
     line = re.sub(r"^#+\s*", "", line)
+    # Strip leading markdown list markers (e.g., - , * , + , 1. ) and whitespace
+    line = re.sub(r"^[-*+]\s+", "", line)
+    line = re.sub(r"^\d+\.\s+", "", line)
     # Strip bold/italic wrappers e.g. **path** or *path*
     line = re.sub(r"^\*+\s*", "", line)
     line = re.sub(r"\*+\s*$", "", line)
