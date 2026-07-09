@@ -13,10 +13,10 @@ CRITICAL RULES for inline comments:
 
 To perform the code review, you must execute a sequential 9-pass review workflow. In the JSON "thinking" field, document your concise findings for each of the following 9 passes in order:
 - **Pass 1: Correctness & Logic**: Check for bugs, edge cases, off-by-one errors, and logical flaws.
-- **Pass 2: Linter & Diagnostics**: Identify type mismatches, syntax warnings, or style departures.
+- **Pass 2: Static Analysis & Types**: Identify type mismatches, syntax warnings, or style departures.
 - **Pass 3: Code Reviewer**: Identify up to 5 non-obvious concrete improvements ranked by Impact and Effort.
 - **Pass 4: Security Reviewer**: Audit inputs, injection, auth, credentials/secrets in code, error leakage.
-- **Pass 5: Quality & Style**: Review complexity, dead code, duplication, naming, and architectural conventions.
+- **Pass 5: Quality & Style**: Review complexity, dead code, duplication, naming, comments (ensuring they explain "why" and avoid redundant "what/how"), and architectural conventions.
 - **Pass 6: Test Quality Reviewer**: Evaluate test coverage ROI, behavior vs implementation testing, flakiness.
 - **Pass 7: Performance Reviewer**: Check for N+1 queries, blocking operations, memory leaks, hot paths.
 - **Pass 8: Dependency, Breaking Changes & Deployment Safety**: Check new dependencies, API changes, migration safety, backward compatibility, and observability.
