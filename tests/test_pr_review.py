@@ -1,5 +1,6 @@
 """Unit tests for the automated code review script."""
 
+import json
 from unittest.mock import MagicMock, patch
 from pr_review import (
     get_modified_lines,
@@ -727,3 +728,117 @@ def test_send_request_timeout_error_then_success(
     assert content == "Success Timeout"
     assert mock_urlopen.call_count == 2
     mock_sleep.assert_called_once()
+
+
+@patch.dict(
+    "os.environ",
+    {
+        "OPENROUTER_API_KEY": "fake_key",
+        "PR_NUMBER": "12",
+        "REPO": "owner/repo",
+        "GH_TOKEN": "fake_github_token",
+        "POST_SUMMARY": "true",
+    },
+)
+@patch("os.path.exists")
+@patch("builtins.open")
+@patch("pr_review.make_openrouter_request")
+@patch("pr_review.submit_github_review")
+def test_main_fallback_summary_on_json_parse_failure(
+    mock_submit: MagicMock,
+    mock_make_req: MagicMock,
+    mock_open: MagicMock,
+    mock_exists: MagicMock,
+) -> None:
+    """Verify that if the LLM output fails to parse as a JSON object, the action is resilient,
+
+    does not crash, and submits a generic warning message pointing developers to logs.
+    """
+    from pr_review import main
+
+    mock_exists.return_value = True
+
+    # Mock reading the diff file
+    mock_file = MagicMock()
+    mock_file.read.return_value = "diff --git a/test.py b/test.py\n..."
+    mock_open.return_value.__enter__.return_value = mock_file
+
+    # Mock LLM returning free-form markdown (so JSON parsing fails)
+    mock_make_req.return_value = "This is a free-form raw LLM response with no JSON."
+
+    main()
+
+    mock_submit.assert_called_once()
+    args = mock_submit.call_args[0]
+    # args: (repo, pr_number, token, final_body, valid_comments)
+    assert args[0] == "owner/repo"
+    assert args[1] == "12"
+    assert args[2] == "fake_github_token"
+    # Verify final_body contains fallback warning but does NOT contain raw prompt-injection risk output
+    assert "could not be parsed as a JSON object" in args[3]
+    assert "workflow execution logs" in args[3]
+    assert "This is a free-form raw LLM response with no JSON." not in args[3]
+    # Verify comments list is empty
+    assert args[4] == []
+
+
+@patch.dict(
+    "os.environ",
+    {
+        "OPENROUTER_API_KEY": "fake_key",
+        "PR_NUMBER": "12",
+        "REPO": "owner/repo",
+        "GH_TOKEN": "fake_github_token",
+        "POST_SUMMARY": "true",
+    },
+)
+@patch("os.path.exists")
+@patch("builtins.open")
+@patch("pr_review.make_openrouter_request")
+@patch("pr_review.submit_github_review")
+def test_main_success_json_parsed(
+    mock_submit: MagicMock,
+    mock_make_req: MagicMock,
+    mock_open: MagicMock,
+    mock_exists: MagicMock,
+) -> None:
+    """Verify the happy-path behavior: when the LLM returns a valid JSON response containing
+
+    both a summary and inline comments, the review is successfully parsed and submitted to GitHub.
+    """
+    from pr_review import main
+
+    mock_exists.return_value = True
+
+    # Mock reading the diff file with an added line 5
+    mock_file = MagicMock()
+    mock_file.read.return_value = """diff --git a/test.py b/test.py
+--- a/test.py
++++ b/test.py
+@@ -1,5 +1,5 @@
+ line1
+ line2
+ line3
+ line4
++line5
+"""
+    mock_open.return_value.__enter__.return_value = mock_file
+
+    # Mock LLM returning valid JSON
+    json_response = {
+        "summary": "Looks good!",
+        "comments": [{"path": "test.py", "line": 5, "body": "Nice change"}],
+    }
+    mock_make_req.return_value = json.dumps(json_response)
+
+    main()
+
+    mock_submit.assert_called_once()
+    args = mock_submit.call_args[0]
+    assert args[3] == "Looks good!"
+    # Verify comment was correctly validated and submitted
+    assert len(args[4]) == 1
+    assert args[4][0]["path"] == "test.py"
+    assert args[4][0]["line"] == 5
+    assert args[4][0]["body"] == "Nice change"
+    assert args[4][0]["side"] == "RIGHT"
