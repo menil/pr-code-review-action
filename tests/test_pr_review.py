@@ -292,6 +292,23 @@ def test_make_openrouter_request_no_fallback_on_unauthorized(
     assert mock_send_request.call_count == 1
 
 
+@patch("pr_review._send_request")
+def test_make_openrouter_request_fallback_on_value_error(
+    mock_send_request: MagicMock,
+) -> None:
+    from pr_review import make_openrouter_request
+
+    mock_send_request.side_effect = [
+        ValueError("OpenRouter returned message with null content"),
+        '{"summary": "Fallback works after value error"}',
+    ]
+
+    result = make_openrouter_request("fake_key", "fake_diff")
+
+    assert result == '{"summary": "Fallback works after value error"}'
+    assert mock_send_request.call_count == 2
+
+
 def test_annotate_diff() -> None:
     diff_text = """diff --git a/src/main.py b/src/main.py
 index 1234567..89abcde 100644
