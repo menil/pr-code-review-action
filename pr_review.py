@@ -489,7 +489,14 @@ def make_openrouter_request(
             {"role": "system", "content": system_instruction},
             {
                 "role": "user",
-                "content": f"Please review this annotated diff:\n\n{annotated_diff}",
+                "content": (
+                    # Explicitly request raw JSON in the prompt as a fallback for models/endpoints
+                    # that ignore the response_format API parameter or wrap JSON in markdown blocks.
+                    f"Please review this annotated diff:\n\n{annotated_diff}\n\n"
+                    "CRITICAL: You must respond ONLY with a valid JSON object matching the schema. "
+                    "Do not include any introductory or concluding text, markdown wrappers, "
+                    "or any content outside of the JSON object itself."
+                ),
             },
         ],
         "response_format": {"type": "json_object"},
@@ -649,7 +656,7 @@ def main() -> None:
 
         try:
             line_int = int(line)
-        except ValueError:
+        except (ValueError, TypeError):
             continue
 
         # Normalize path: strip a/ or b/ prefixes and leading slashes
@@ -685,9 +692,11 @@ def main() -> None:
         else:
             final_body = (
                 "Automated code review completed.\n\n"
-                "> [!NOTE]\n"
-                "> The structured code review summary could not be parsed as a JSON object, "
-                "but inline comments were successfully extracted from the review response."
+                "> [!WARNING]\n"
+                "> The structured code review summary could not be parsed as a JSON object. "
+                "For security reasons (to prevent indirect prompt injection vectors), "
+                "the raw review feedback is not posted on the pull request thread. "
+                "Please check the GitHub Actions workflow execution logs to view the raw feedback."
             )
 
     if is_truncated and post_summary:
@@ -697,25 +706,9 @@ def main() -> None:
             "might not have been fully reviewed."
         )
 
-    # Decide if we should submit a review to GitHub
-    should_submit = False
-    if valid_comments:
-        should_submit = True
-    elif post_summary and json_parsed:
-        should_submit = True
-    elif not post_summary:
-        # Always submit review when post_summary is False so the user knows it ran
-        should_submit = True
-
-    if should_submit:
-        print(
-            f"Submitting review to GitHub with {len(valid_comments)} inline comments..."
-        )
-        submit_github_review(repo, pr_number, token, final_body, valid_comments)
-    else:
-        print(
-            "No inline comments and no review summary to post. Skipping GitHub review submission."
-        )
+    # Always submit a review so the user receives the status and summary feedback
+    print(f"Submitting review to GitHub with {len(valid_comments)} inline comments...")
+    submit_github_review(repo, pr_number, token, final_body, valid_comments)
 
 
 if __name__ == "__main__":
