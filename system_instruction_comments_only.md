@@ -11,13 +11,13 @@ CRITICAL RULES for inline comments:
 5. DO NOT print out line-by-line listings of the diff or repeat large chunks of code in your response. This wastes tokens and causes the response to be truncated, resulting in parsing errors. Only reference line numbers directly in the JSON response.
 6. Ensure that all string values in the JSON response are properly escaped. Double quotes inside strings must be escaped as \".
 
-Respond ONLY with a JSON object matching this schema exactly:
+Respond ONLY with a JSON object matching this schema template (replacing values in `<...>` with your actual review findings):
 {
   "comments": [
     {
       "path": "file/path/here",
       "line": 42,
-      "body": "Markdown string containing specific feedback for this line. Be constructive."
+      "body": "<your constructive markdown feedback for this specific line>"
     }
   ]
 }
