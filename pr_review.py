@@ -752,41 +752,64 @@ def main() -> None:
         max_tokens = 4096
 
     print("Requesting review from OpenRouter...")
-    try:
-        raw_response = make_openrouter_request(
-            api_key=api_key,
-            diff_content=diff_content,
-            post_summary=post_summary,
-            model=model,
-            base_url=base_url,
-            max_tokens=max_tokens,
-            repo=repo,
-        )
-    except Exception as e:
-        print(f"Error: API request failed: {e}", file=sys.stderr)
-        sys.exit(1)
-
+    raw_response = ""
     json_parsed = False
-    try:
-        review_data = parse_llm_json(raw_response)
+    review_data = {}
+
+    max_review_attempts = 3
+    last_exception = None
+
+    for attempt in range(1, max_review_attempts + 1):
+        try:
+            raw_response = make_openrouter_request(
+                api_key=api_key,
+                diff_content=diff_content,
+                post_summary=post_summary,
+                model=model,
+                base_url=base_url,
+                max_tokens=max_tokens,
+                repo=repo,
+            )
+            review_data = parse_llm_json(raw_response)
+            json_parsed = True
+            break
+        except Exception as e:
+            last_exception = e
+            if attempt < max_review_attempts:
+                print(
+                    f"Warning: Review attempt {attempt} failed (error or malformed JSON): {e}. "
+                    "Retrying request...",
+                    file=sys.stderr,
+                )
+                time.sleep(2.0 * attempt)
+
+    if json_parsed:
         summary = review_data.get("summary", "Automated code review completed.")
         if not isinstance(summary, str):
             summary = str(summary)
         llm_comments = review_data.get("comments", [])
         if not isinstance(llm_comments, list):
             llm_comments = []
-        json_parsed = True
-    except Exception as e:
+    else:
         print(
-            f"Warning: Failed to parse structured JSON from LLM review: {e}. "
-            "Attempting to parse comments from free-form markdown text...",
+            f"Error: All {max_review_attempts} review attempts failed. Last error: {last_exception}",
             file=sys.stderr,
         )
-        print("--- RAW LLM RESPONSE START ---", file=sys.stderr)
-        print(raw_response, file=sys.stderr)
-        print("--- RAW LLM RESPONSE END ---", file=sys.stderr)
-        llm_comments = parse_markdown_comments(raw_response, modified_lines)
-        summary = "Automated code review completed (JSON parsing failed, fallback comments parsed)."
+        if raw_response:
+            print(
+                "Attempting to parse comments from free-form markdown text of last response...",
+                file=sys.stderr,
+            )
+            print("--- RAW LLM RESPONSE START ---", file=sys.stderr)
+            print(raw_response, file=sys.stderr)
+            print("--- RAW LLM RESPONSE END ---", file=sys.stderr)
+            llm_comments = parse_markdown_comments(raw_response, modified_lines)
+            summary = "Automated code review completed (JSON parsing failed, fallback comments parsed)."
+        else:
+            print(
+                "Error: Could not retrieve review response from API.", file=sys.stderr
+            )
+            sys.exit(1)
 
     print(f"Filtering {len(llm_comments)} suggested comments against modified lines...")
     valid_comments = []
