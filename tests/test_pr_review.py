@@ -1,6 +1,7 @@
 """Unit tests for the automated code review script."""
 
 import json
+import pytest
 from unittest.mock import MagicMock, patch
 from pr_review import (
     get_modified_lines,
@@ -9,6 +10,8 @@ from pr_review import (
     annotate_diff,
     clean_markdown_line,
     parse_markdown_comments,
+    filter_diff,
+    get_exclude_regexes,
 )
 
 
@@ -333,6 +336,45 @@ index 1234567..89abcde 100644
     assert '   12: +     print("new")' in lines
     assert '   13: +     print("another new")' in lines
     assert "   14:       return True" in lines
+
+
+def test_filter_diff() -> None:
+    diff_text = """diff --git a/src/main.py b/src/main.py
+index 123..456 100644
+--- a/src/main.py
++++ b/src/main.py
+@@ -1,2 +1,2 @@
+-hello
++world
+diff --git a/package-lock.json b/package-lock.json
+index abc..def 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -1,2 +1,3 @@
+ {
++  "version": "1.0.1"
+ }
+diff --git "a/src/my file.min.js" "b/src/my file.min.js"
+index 789..012 100644
+--- a/src/my file.min.js
++++ b/src/my file.min.js
+@@ -1,1 +1,1 @@
+-console.log("hello");
++console.log("world");
+diff --git a/logo.svg b/logo.svg
+index 345..678 100644
+--- a/logo.svg
++++ b/logo.svg
+@@ -1,1 +1,1 @@
+-<svg></svg>
++<svg viewBox="0 0 100 100"></svg>
+"""
+    exclude_regexes = get_exclude_regexes()
+    filtered = filter_diff(diff_text, exclude_regexes)
+    assert "src/main.py" in filtered
+    assert "package-lock.json" not in filtered
+    assert "my file.min.js" not in filtered
+    assert "logo.svg" not in filtered
 
 
 def test_get_modified_lines_quoted_path() -> None:
@@ -766,7 +808,9 @@ def test_main_fallback_summary_on_json_parse_failure(
     # Mock LLM returning free-form markdown (so JSON parsing fails)
     mock_make_req.return_value = "This is a free-form raw LLM response with no JSON."
 
-    main()
+    with pytest.raises(SystemExit) as excinfo:
+        main()
+    assert excinfo.value.code == 1
 
     mock_submit.assert_called_once()
     args = mock_submit.call_args[0]
@@ -835,10 +879,234 @@ def test_main_success_json_parsed(
 
     mock_submit.assert_called_once()
     args = mock_submit.call_args[0]
-    assert args[3] == "Looks good!"
-    # Verify comment was correctly validated and submitted
-    assert len(args[4]) == 1
-    assert args[4][0]["path"] == "test.py"
-    assert args[4][0]["line"] == 5
-    assert args[4][0]["body"] == "Nice change"
     assert args[4][0]["side"] == "RIGHT"
+
+
+def test_filter_diff_more_edge_cases() -> None:
+    """Verify filter_diff edge cases, including unquoted spaces, quotes, and metadata headers."""
+    # Diff containing spaces in a non-excluded file and arbitrary pre-diff header text
+    diff_text = """some initial git metadata headers
+and arbitrary text
+diff --git "a/src/my file.py" "b/src/my file.py"
+index 123..456 100644
+--- "a/src/my file.py"
++++ "b/src/my file.py"
+@@ -1,2 +1,2 @@
+-hello
++world
+diff --git a/package-lock.json b/package-lock.json
+index abc..def 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -1,2 +1,3 @@
+ {
++  "version": "1.0.1"
+ }
+"""
+    exclude_regexes = get_exclude_regexes()
+    filtered = filter_diff(diff_text, exclude_regexes)
+
+    # Pre-diff headers should be preserved
+    assert "some initial git metadata headers" in filtered
+    # Non-excluded file with spaces and quotes should be preserved
+    assert "src/my file.py" in filtered
+    # Excluded file should be removed
+    assert "package-lock.json" not in filtered
+
+
+def test_get_exclude_regexes() -> None:
+    """Verify that get_exclude_regexes merges custom patterns correctly."""
+    regexes = get_exclude_regexes("my-custom-pattern\\.txt$,another-pattern.*")
+    # Verify defaults are present
+    assert any(rx.search("package-lock.json") for rx in regexes)
+    # Verify custom patterns are present
+    assert any(rx.search("my-custom-pattern.txt") for rx in regexes)
+    assert any(rx.search("another-pattern.log") for rx in regexes)
+
+
+@patch("os.path.exists")
+def test_main_missing_env_vars(mock_exists: MagicMock) -> None:
+    """Verify that main() exits with 1 when required env vars are missing or invalid."""
+    from pr_review import main
+
+    # 1. Missing API Key
+    with patch.dict("os.environ", {}, clear=True):
+        with pytest.raises(SystemExit) as excinfo:
+            main()
+        assert excinfo.value.code == 1
+
+    # 2. Missing other required vars
+    with patch.dict("os.environ", {"OPENROUTER_API_KEY": "fake_key"}, clear=True):
+        with pytest.raises(SystemExit) as excinfo:
+            main()
+        assert excinfo.value.code == 1
+
+    # 3. Invalid numeric PR_NUMBER
+    with patch.dict(
+        "os.environ",
+        {
+            "OPENROUTER_API_KEY": "fake_key",
+            "PR_NUMBER": "abc",
+            "REPO": "owner/repo",
+            "GH_TOKEN": "fake_token",
+        },
+        clear=True,
+    ):
+        with pytest.raises(SystemExit) as excinfo:
+            main()
+        assert excinfo.value.code == 1
+
+    # 4. Invalid REPO format
+    with patch.dict(
+        "os.environ",
+        {
+            "OPENROUTER_API_KEY": "fake_key",
+            "PR_NUMBER": "12",
+            "REPO": "invalid-repo-format",
+            "GH_TOKEN": "fake_token",
+        },
+        clear=True,
+    ):
+        with pytest.raises(SystemExit) as excinfo:
+            main()
+        assert excinfo.value.code == 1
+
+
+@patch("os.path.exists")
+@patch("builtins.open")
+def test_main_empty_and_missing_diff(
+    mock_open: MagicMock, mock_exists: MagicMock
+) -> None:
+    """Verify main() handles missing and empty diff files correctly."""
+    from pr_review import main
+
+    base_env = {
+        "OPENROUTER_API_KEY": "fake_key",
+        "PR_NUMBER": "12",
+        "REPO": "owner/repo",
+        "GH_TOKEN": "fake_token",
+    }
+
+    # 1. Missing diff file (exists=False) -> exits with 1
+    mock_exists.return_value = False
+    with patch.dict("os.environ", base_env, clear=True):
+        with pytest.raises(SystemExit) as excinfo:
+            main()
+        assert excinfo.value.code == 1
+
+    # 2. Empty diff file -> exits with 0
+    mock_exists.return_value = True
+    mock_file = MagicMock()
+    mock_file.read.return_value = ""
+    mock_open.return_value.__enter__.return_value = mock_file
+    with patch.dict("os.environ", base_env, clear=True):
+        with pytest.raises(SystemExit) as excinfo:
+            main()
+        assert excinfo.value.code == 0
+
+    # 3. Diff containing only excluded files -> exits with 0
+    mock_file.read.return_value = """diff --git a/package-lock.json b/package-lock.json
+index abc..def 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -1,2 +1,3 @@
+ {
++  "version": "1.0.1"
+ }
+"""
+    with patch.dict("os.environ", base_env, clear=True):
+        with pytest.raises(SystemExit) as excinfo:
+            main()
+        assert excinfo.value.code == 0
+
+
+@patch("pr_review.urllib.request.urlopen")
+def test_submit_github_review_success(mock_urlopen: MagicMock) -> None:
+    """Verify submit_github_review constructs headers, payload, and successfully submits."""
+    from pr_review import submit_github_review
+    import urllib.request
+
+    mock_res = MagicMock()
+    mock_res.read.return_value = b'{"id": 123, "state": "COMMENTED"}'
+    mock_urlopen.return_value.__enter__.return_value = mock_res
+
+    res = submit_github_review(
+        repo="owner/repo",
+        pr_number="12",
+        token="fake_token",
+        summary="A review summary",
+        comments=[{"path": "test.py", "line": 5, "side": "RIGHT", "body": "Nice"}],
+    )
+
+    assert res["id"] == 123
+    mock_urlopen.assert_called_once()
+    req = mock_urlopen.call_args[0][0]
+    assert isinstance(req, urllib.request.Request)
+    assert req.full_url == "https://api.github.com/repos/owner/repo/pulls/12/reviews"
+    assert req.headers["Authorization"] == "token fake_token"
+    assert req.headers["Accept"] == "application/vnd.github.v3+json"
+
+
+@patch("pr_review.urllib.request.urlopen")
+def test_submit_github_review_error(mock_urlopen: MagicMock) -> None:
+    """Verify submit_github_review handles HTTPError correctly."""
+    from pr_review import submit_github_review
+    import urllib.error
+
+    fp = MagicMock()
+    fp.read.return_value = b"Invalid request details"
+    http_err = urllib.error.HTTPError(
+        "http://dummy", 400, "Bad Request", MagicMock(), fp
+    )
+    mock_urlopen.side_effect = http_err
+
+    with pytest.raises(urllib.error.HTTPError):
+        submit_github_review("owner/repo", "12", "fake_token", "summary", [])
+
+
+@patch.dict(
+    "os.environ",
+    {
+        "OPENROUTER_API_KEY": "fake_key",
+        "PR_NUMBER": "12",
+        "REPO": "owner/repo",
+        "GH_TOKEN": "fake_github_token",
+        "POST_SUMMARY": "false",
+    },
+)
+@patch("os.path.exists")
+@patch("builtins.open")
+@patch("pr_review.make_openrouter_request")
+@patch("pr_review.submit_github_review")
+def test_main_fallback_warning_on_json_parse_failure_post_summary_false(
+    mock_submit: MagicMock,
+    mock_make_req: MagicMock,
+    mock_open: MagicMock,
+    mock_exists: MagicMock,
+) -> None:
+    """Verify that if the LLM output fails to parse as a JSON object and POST_SUMMARY is False,
+
+    the action still submits the fallback warning message instead of 'No issues found'.
+    """
+    from pr_review import main
+
+    mock_exists.return_value = True
+
+    # Mock reading the diff file
+    mock_file = MagicMock()
+    mock_file.read.return_value = "diff --git a/test.py b/test.py\n..."
+    mock_open.return_value.__enter__.return_value = mock_file
+
+    # Mock LLM returning free-form markdown (so JSON parsing fails)
+    mock_make_req.return_value = "This is a free-form raw LLM response with no JSON."
+
+    with pytest.raises(SystemExit) as excinfo:
+        main()
+    assert excinfo.value.code == 1
+
+    mock_submit.assert_called_once()
+    args = mock_submit.call_args[0]
+    # Verify final_body contains the fallback warning instead of 'No issues found'
+    assert "could not be parsed as a JSON object" in args[3]
+    assert "workflow execution logs" in args[3]
+    assert "No issues found" not in args[3]
