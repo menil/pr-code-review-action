@@ -52,15 +52,15 @@ Verdict Guidelines:
 - Needs Attention: Has medium issues or important suggestions.
 - Needs Work: Has critical/high issues or major bugs.
 
-Respond ONLY with a JSON object matching this schema exactly:
+Respond ONLY with a JSON object matching this schema template (replacing values in `<...>` with your actual review findings):
 {
-  "thinking": "Concise summary of findings for each of the 10 sequential review passes (numbered Pass 1 to Pass 10).",
-  "summary": "Overall markdown summary following the required synthesis format.",
+  "thinking": "<concise summary of findings for each of the 10 sequential review passes>",
+  "summary": "<overall markdown summary following the required synthesis format>",
   "comments": [
     {
       "path": "file/path/here",
       "line": 42,
-      "body": "Markdown string containing specific feedback for this line. Be constructive."
+      "body": "<your constructive markdown feedback for this specific line>"
     }
   ]
 }
