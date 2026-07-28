@@ -782,6 +782,7 @@ def test_send_request_timeout_error_then_success(
         "POST_SUMMARY": "true",
     },
 )
+@patch("time.sleep")
 @patch("os.path.exists")
 @patch("builtins.open")
 @patch("pr_review.make_openrouter_request")
@@ -791,6 +792,7 @@ def test_main_fallback_summary_on_json_parse_failure(
     mock_make_req: MagicMock,
     mock_open: MagicMock,
     mock_exists: MagicMock,
+    mock_sleep: MagicMock,
 ) -> None:
     """Verify that if the LLM output fails to parse as a JSON object, the action is resilient,
 
@@ -812,6 +814,7 @@ def test_main_fallback_summary_on_json_parse_failure(
         main()
     assert excinfo.value.code == 1
 
+    assert mock_sleep.call_count == 2
     mock_submit.assert_called_once()
     args = mock_submit.call_args[0]
     # args: (repo, pr_number, token, final_body, valid_comments)
@@ -1074,6 +1077,7 @@ def test_submit_github_review_error(mock_urlopen: MagicMock) -> None:
         "POST_SUMMARY": "false",
     },
 )
+@patch("time.sleep")
 @patch("os.path.exists")
 @patch("builtins.open")
 @patch("pr_review.make_openrouter_request")
@@ -1083,6 +1087,7 @@ def test_main_fallback_warning_on_json_parse_failure_post_summary_false(
     mock_make_req: MagicMock,
     mock_open: MagicMock,
     mock_exists: MagicMock,
+    mock_sleep: MagicMock,
 ) -> None:
     """Verify that if the LLM output fails to parse as a JSON object and POST_SUMMARY is False,
 
@@ -1104,6 +1109,7 @@ def test_main_fallback_warning_on_json_parse_failure_post_summary_false(
         main()
     assert excinfo.value.code == 1
 
+    assert mock_sleep.call_count == 2
     mock_submit.assert_called_once()
     args = mock_submit.call_args[0]
     # Verify final_body contains the fallback warning instead of 'No issues found'
