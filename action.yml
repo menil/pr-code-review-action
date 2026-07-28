@@ -29,6 +29,11 @@ inputs:
     description: 'Whether to post the high-level summary as the review body'
     required: false
     default: 'true'
+  exclude_patterns:
+    description: 'Comma or newline separated custom regex patterns to exclude from review'
+    required: false
+    default: ''
+
 
 runs:
   using: 'composite'
@@ -42,8 +47,10 @@ runs:
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github_token }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        REPOSITORY: ${{ github.repository }}
       run: |
-        gh pr diff ${{ github.event.pull_request.number }} --repo ${{ github.repository }} > pr.diff
+        gh pr diff "$PR_NUMBER" --repo "$REPOSITORY" > pr.diff
 
     - name: Run Review Script
       shell: bash
@@ -56,4 +63,6 @@ runs:
         REPO: ${{ github.repository }}
         GH_TOKEN: ${{ inputs.github_token }}
         POST_SUMMARY: ${{ inputs.post_summary }}
+        EXCLUDE_PATTERNS: ${{ inputs.exclude_patterns }}
       run: python ${{ github.action_path }}/pr_review.py
+
