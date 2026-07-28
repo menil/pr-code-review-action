@@ -16,27 +16,79 @@ from typing import Any
 import urllib.error
 import urllib.request
 
+# Default patterns of files to exclude from code review
+DEFAULT_EXCLUDE_PATTERNS = [
+    # Lock files
+    r"package-lock\.json$",
+    r"yarn\.lock$",
+    r"pnpm-lock\.yaml$",
+    r"Cargo\.lock$",
+    r"poetry\.lock$",
+    r"mix\.lock$",
+    r"go\.sum$",
+    r"composer\.lock$",
+    r"pdm\.lock$",
+    r"Pipfile\.lock$",
+    r"bun\.lockb$",
+    r"deno\.lock$",
+    # Jest snapshots
+    r"\.snap$",
+    # Minified files
+    r"\.min\.js$",
+    r"\.min\.css$",
+    # Build maps
+    r"\.map$",
+    # Images/vectors/binaries
+    r"\.svg$",
+    r"\.png$",
+    r"\.jpg$",
+    r"\.jpeg$",
+    r"\.gif$",
+    r"\.ico$",
+]
+
+# Pre-compiled regular expressions for efficiency
+JSON_CLEAN_RE = re.compile(r'("(?:\\.|[^"\\])*")|,(\s*[}\]])')
+
+MD_HEADER_RE = re.compile(r"^#+\s*")
+MD_LIST_RE = re.compile(r"^[-*+]\s+")
+MD_NUM_LIST_RE = re.compile(r"^\d+\.\s+")
+MD_BOLD_START_RE = re.compile(r"^\*+\s*")
+MD_BOLD_END_RE = re.compile(r"\*+\s*$")
+MD_BACKTICK_START_RE = re.compile(r"^`\s*")
+MD_BACKTICK_END_RE = re.compile(r"`\s*$")
+
+
+def get_exclude_regexes(
+    custom_patterns_str: str | None = None,
+) -> list[re.Pattern[str]]:
+    """Compile and return the complete list of exclusion regex patterns.
+
+    Allows matching both default and custom-supplied exclusions.
+    """
+    patterns = list(DEFAULT_EXCLUDE_PATTERNS)
+    if custom_patterns_str:
+        # Split custom exclusions by comma or newline
+        custom_list = [
+            p.strip() for p in re.split(r"[,\n]", custom_patterns_str) if p.strip()
+        ]
+        patterns.extend(custom_list)
+    return [re.compile(p, re.IGNORECASE) for p in patterns]
+
 
 def get_modified_lines(diff_text: str) -> dict[str, set[int]]:
     """Parse a unified diff and return a map of files to their modified new line numbers."""
     modified: dict[str, set[int]] = {}
     current_file: str | None = None
     new_line_num: int = 0
+    in_header: bool = True
 
     for line in diff_text.splitlines():
-        if line.startswith("+++ "):
-            path_part = line[4:]
-            if path_part.startswith('"') and path_part.endswith('"'):
-                path_part = path_part[1:-1]
-            if path_part.startswith("b/"):
-                current_file = path_part[2:]
-                modified[current_file] = set()
-            elif path_part == "/dev/null":
-                current_file = None
-            else:
-                current_file = path_part
-                modified[current_file] = set()
+        if line.startswith("diff --git "):
+            in_header = True
+            current_file = None
         elif line.startswith("@@"):
+            in_header = False
             try:
                 # Format: @@ -old_start,old_len +new_start,new_len @@ ...
                 parts = line.split()
@@ -48,7 +100,19 @@ def get_modified_lines(diff_text: str) -> dict[str, set[int]]:
             except (ValueError, IndexError):
                 # If parsing fails, ignore this hunk's start and skip line counting
                 current_file = None
-        elif current_file is not None:
+        elif in_header and line.startswith("+++ "):
+            path_part = line[4:]
+            if path_part.startswith('"') and path_part.endswith('"'):
+                path_part = path_part[1:-1]
+            if path_part.startswith("b/"):
+                current_file = path_part[2:]
+                modified[current_file] = set()
+            elif path_part == "/dev/null":
+                current_file = None
+            else:
+                current_file = path_part
+                modified[current_file] = set()
+        elif current_file is not None and not in_header:
             if line.startswith("+") and not line.startswith("+++"):
                 new_line_num += 1
                 modified[current_file].add(new_line_num)
@@ -65,20 +129,15 @@ def annotate_diff(diff_text: str) -> str:
     annotated_lines = []
     current_file: str | None = None
     new_line_num: int = 0
+    in_header: bool = True
 
     for line in diff_text.splitlines():
-        if line.startswith("+++ "):
-            path_part = line[4:]
-            if path_part.startswith('"') and path_part.endswith('"'):
-                path_part = path_part[1:-1]
-            if path_part.startswith("b/"):
-                current_file = path_part[2:]
-            elif path_part == "/dev/null":
-                current_file = None
-            else:
-                current_file = path_part
+        if line.startswith("diff --git "):
+            in_header = True
+            current_file = None
             annotated_lines.append(line)
         elif line.startswith("@@"):
+            in_header = False
             try:
                 parts = line.split()
                 if len(parts) >= 3:
@@ -89,7 +148,18 @@ def annotate_diff(diff_text: str) -> str:
             except (ValueError, IndexError):
                 current_file = None
             annotated_lines.append(line)
-        elif current_file is not None:
+        elif in_header and line.startswith("+++ "):
+            path_part = line[4:]
+            if path_part.startswith('"') and path_part.endswith('"'):
+                path_part = path_part[1:-1]
+            if path_part.startswith("b/"):
+                current_file = path_part[2:]
+            elif path_part == "/dev/null":
+                current_file = None
+            else:
+                current_file = path_part
+            annotated_lines.append(line)
+        elif current_file is not None and not in_header:
             if line.startswith("+") and not line.startswith("+++"):
                 new_line_num += 1
                 annotated_lines.append(f"{new_line_num:5d}: {line}")
@@ -106,15 +176,48 @@ def annotate_diff(diff_text: str) -> str:
     return "\n".join(annotated_lines)
 
 
+def filter_diff(diff_text: str, exclude_regexes: list[re.Pattern[str]]) -> str:
+    """Filter out lock files, minified files, SVG files, and other non-reviewable files from the unified diff."""
+    lines = diff_text.splitlines(keepends=True)
+    filtered_lines = []
+    current_file_excluded = False
+
+    for line in lines:
+        if line.startswith("diff --git "):
+            first_line = line.strip()
+            # Find the path following "b/"
+            b_idx = first_line.find(' "b/')
+            if b_idx != -1:
+                file_path = first_line[b_idx + 4 :].strip()
+                if file_path.endswith('"'):
+                    file_path = file_path[:-1]
+            else:
+                b_idx = first_line.find(" b/")
+                if b_idx != -1:
+                    words = first_line[b_idx + 3 :].split()
+                    file_path = words[0] if words else ""
+                else:
+                    file_path = ""
+
+            if file_path and any(rx.search(file_path) for rx in exclude_regexes):
+                current_file_excluded = True
+                print(f"Skipping diff section for excluded file: {file_path}")
+            else:
+                current_file_excluded = False
+
+        if not current_file_excluded:
+            filtered_lines.append(line)
+
+    return "".join(filtered_lines)
+
+
 def parse_llm_json(response_text: str) -> dict[str, Any]:
     """Parse JSON output from LLM, stripping markdown block wrappers or extracting the JSON block."""
     response_text = response_text.strip()
 
     def clean_json(text: str) -> str:
         # Replace trailing commas (ignoring those inside strings)
-        return re.sub(
-            r'("(?:\\.|[^"\\])*")|,(\s*[}\]])', lambda m: m.group(1) or m.group(2), text
-        )
+        return JSON_CLEAN_RE.sub(lambda m: m.group(1) or m.group(2), text)
 
     # Try direct parse first
     try:
@@ -158,16 +261,16 @@ def clean_markdown_line(line: str) -> str:
     """Clean markdown markers (headers, bold, italics, backticks) from a line."""
     line = line.strip()
     # Strip leading '#' characters and whitespace
-    line = re.sub(r"^#+\s*", "", line)
+    line = MD_HEADER_RE.sub("", line)
     # Strip leading markdown list markers (e.g., - , * , + , 1. ) and whitespace
-    line = re.sub(r"^[-*+]\s+", "", line)
-    line = re.sub(r"^\d+\.\s+", "", line)
+    line = MD_LIST_RE.sub("", line)
+    line = MD_NUM_LIST_RE.sub("", line)
     # Strip bold/italic wrappers e.g. **path** or *path*
-    line = re.sub(r"^\*+\s*", "", line)
-    line = re.sub(r"\*+\s*$", "", line)
+    line = MD_BOLD_START_RE.sub("", line)
+    line = MD_BOLD_END_RE.sub("", line)
     # Strip backticks
-    line = re.sub(r"^`\s*", "", line)
-    line = re.sub(r"`\s*$", "", line)
+    line = MD_BACKTICK_START_RE.sub("", line)
+    line = MD_BACKTICK_END_RE.sub("", line)
     return line.strip()
 
 
@@ -178,6 +281,29 @@ def parse_markdown_comments(
     comments: list[dict[str, Any]] = []
     current_file: str | None = None
     current_comment: dict[str, Any] | None = None
+
+    # Pre-compute lowercase paths, basenames, and patterns for efficient lookups outside the line loop
+    path_lookups = []
+    for path in modified_lines:
+        norm_path = path.lower()
+        basename = os.path.basename(path).lower()
+        patterns = {
+            norm_path,
+            basename,
+            f"in {norm_path}",
+            f"in {basename}",
+            f"file: {norm_path}",
+            f"file: {basename}",
+            f"file {norm_path}",
+            f"file {basename}",
+            f"review of {norm_path}",
+            f"review of {basename}",
+            f"review for {norm_path}",
+            f"review for {basename}",
+            f"review {norm_path}",
+            f"review {basename}",
+        }
+        path_lookups.append((path, norm_path, basename, patterns))
 
     # Pattern for line numbers
     # Matches:
@@ -196,30 +322,10 @@ def parse_markdown_comments(
 
         # Check if line indicates a file path from modified_lines
         found_file = False
-        for path in modified_lines:
-            norm_path = path.lower()
-            basename = os.path.basename(path).lower()
-            cleaned_lower = cleaned.lower()
+        cleaned_lower = cleaned.lower()
+        cleaned_pat = cleaned_lower.rstrip(":").strip()
 
-            patterns = [
-                norm_path,
-                basename,
-                f"in {norm_path}",
-                f"in {basename}",
-                f"file: {norm_path}",
-                f"file: {basename}",
-                f"file {norm_path}",
-                f"file {basename}",
-                f"review of {norm_path}",
-                f"review of {basename}",
-                f"review for {norm_path}",
-                f"review for {basename}",
-                f"review {norm_path}",
-                f"review {basename}",
-            ]
-
-            cleaned_pat = cleaned_lower.rstrip(":").strip()
-
+        for path, norm_path, basename, patterns in path_lookups:
             if cleaned_pat in patterns or (
                 (cleaned_lower.startswith("###") or cleaned_lower.startswith("##"))
                 and (norm_path in cleaned_lower or basename in cleaned_lower)
@@ -447,13 +553,15 @@ def _send_request(url: str, payload: dict[str, Any], headers: dict[str, str]) ->
 
 
 def make_openrouter_request(
-    api_key: str, diff_content: str, post_summary: bool = True
+    api_key: str,
+    diff_content: str,
+    post_summary: bool = True,
+    model: str = "openrouter/free",
+    base_url: str = "https://openrouter.ai/api/v1/chat/completions",
+    max_tokens: int = 4096,
+    repo: str = "pr-code-review-action",
 ) -> str:
-    """Call OpenRouter API to review the diff content using Gemini 2.0 Flash."""
-    url = os.environ.get(
-        "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1/chat/completions"
-    )
-    repo = os.environ.get("REPO", "pr-code-review-action")
+    """Call OpenRouter API to review the diff content using the specified model."""
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -474,12 +582,6 @@ def make_openrouter_request(
     except Exception as e:
         print(f"Error reading {instruction_file}: {e}", file=sys.stderr)
         sys.exit(1)
-
-    model = os.environ.get("OPENROUTER_MODEL", "openrouter/free")
-    try:
-        max_tokens = int(os.environ.get("OPENROUTER_MAX_TOKENS", "4096"))
-    except ValueError:
-        max_tokens = 4096
 
     annotated_diff = annotate_diff(diff_content)
 
@@ -506,7 +608,7 @@ def make_openrouter_request(
 
     print(f"Requesting review from OpenRouter using model: {model} (JSON mode)...")
     try:
-        return _send_request(url, payload, headers)
+        return _send_request(base_url, payload, headers)
     except Exception as e:
         err_msg = str(e)
         is_json_error = (
@@ -522,7 +624,7 @@ def make_openrouter_request(
             payload_fallback = payload.copy()
             payload_fallback.pop("response_format", None)
             try:
-                return _send_request(url, payload_fallback, headers)
+                return _send_request(base_url, payload_fallback, headers)
             except Exception as fallback_err:
                 print(
                     f"Error: Fallback request also failed: {fallback_err}",
@@ -572,6 +674,7 @@ def submit_github_review(
 
 
 def main() -> None:
+    """Validate environment configurations, process diff content, and submit review."""
     # Load and validate environment variables
     api_key = os.environ.get("OPENROUTER_API_KEY")
     pr_number = os.environ.get("PR_NUMBER")
@@ -593,6 +696,14 @@ def main() -> None:
         )
         sys.exit(1)
 
+    # Harden input parameters to prevent URL injection/manipulation
+    if not pr_number.isdigit():
+        print("Error: PR_NUMBER must be numeric.", file=sys.stderr)
+        sys.exit(1)
+    if not re.match(r"^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$", repo):
+        print("Error: REPO must be in 'owner/repo' format.", file=sys.stderr)
+        sys.exit(1)
+
     # Read diff file
     diff_path = "pr.diff"
     if not os.path.exists(diff_path):
@@ -606,6 +717,23 @@ def main() -> None:
         print("PR diff is empty. Skipping review.")
         sys.exit(0)
 
+    # Retrieve and compile exclusion patterns
+    custom_excludes = os.environ.get("EXCLUDE_PATTERNS")
+    exclude_regexes = get_exclude_regexes(custom_excludes)
+
+    # Filter out lock files, generated/binary assets, etc. to prevent excessive diff size
+    try:
+        diff_content = filter_diff(diff_content, exclude_regexes)
+    except Exception as e:
+        print(
+            f"Warning: Failed to filter diff: {e}. Proceeding with unfiltered diff.",
+            file=sys.stderr,
+        )
+
+    if not diff_content.strip():
+        print("PR diff is empty after filtering excluded files. Skipping review.")
+        sys.exit(0)
+
     # Truncate diff if it is too large (> 500KB) to stay within LLM token limits
     is_truncated = len(diff_content) > 500000
     diff_content = truncate_diff(diff_content, 500000)
@@ -613,9 +741,27 @@ def main() -> None:
     print("Parsing modified line numbers from diff...")
     modified_lines = get_modified_lines(diff_content)
 
+    # Retrieve parameterized configuration for OpenRouter API call
+    model = os.environ.get("OPENROUTER_MODEL", "openrouter/free")
+    base_url = os.environ.get(
+        "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1/chat/completions"
+    )
+    try:
+        max_tokens = int(os.environ.get("OPENROUTER_MAX_TOKENS", "4096"))
+    except ValueError:
+        max_tokens = 4096
+
     print("Requesting review from OpenRouter...")
     try:
-        raw_response = make_openrouter_request(api_key, diff_content, post_summary)
+        raw_response = make_openrouter_request(
+            api_key=api_key,
+            diff_content=diff_content,
+            post_summary=post_summary,
+            model=model,
+            base_url=base_url,
+            max_tokens=max_tokens,
+            repo=repo,
+        )
     except Exception as e:
         print(f"Error: API request failed: {e}", file=sys.stderr)
         sys.exit(1)
@@ -681,23 +827,22 @@ def main() -> None:
             print(f"Skipped comment targeting unchanged line: {path}:{line}")
 
     # Build the final review body depending on post_summary and json_parsed
-    if not post_summary:
+    if not json_parsed:
+        final_body = (
+            "Automated code review completed.\n\n"
+            "> [!WARNING]\n"
+            "> The structured code review summary could not be parsed as a JSON object. "
+            "For security reasons (to prevent indirect prompt injection vectors), "
+            "the raw review feedback is not posted on the pull request thread. "
+            "Please check the GitHub Actions workflow execution logs to view the raw feedback."
+        )
+    elif not post_summary:
         if valid_comments:
             final_body = f"Automated code review completed. Posted {len(valid_comments)} inline comment(s) on specific lines."
         else:
             final_body = "Automated code review completed. No issues found."
     else:
-        if json_parsed:
-            final_body = summary
-        else:
-            final_body = (
-                "Automated code review completed.\n\n"
-                "> [!WARNING]\n"
-                "> The structured code review summary could not be parsed as a JSON object. "
-                "For security reasons (to prevent indirect prompt injection vectors), "
-                "the raw review feedback is not posted on the pull request thread. "
-                "Please check the GitHub Actions workflow execution logs to view the raw feedback."
-            )
+        final_body = summary
 
     if is_truncated and post_summary:
         final_body += (
@@ -709,6 +854,13 @@ def main() -> None:
     # Always submit a review so the user receives the status and summary feedback
     print(f"Submitting review to GitHub with {len(valid_comments)} inline comments...")
     submit_github_review(repo, pr_number, token, final_body, valid_comments)
+
+    if not json_parsed:
+        print(
+            "Error: JSON parsing of LLM response failed. Exiting with failure status.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 if __name__ == "__main__":
