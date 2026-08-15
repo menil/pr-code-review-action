@@ -88,3 +88,11 @@ nix-shell
 # Run linting, formatting check, and test suite
 just validate
 ```
+
+If you use [direnv](https://direnv.net/), the checked-in `.envrc` loads the
+nix shell automatically when you enter the directory:
+
+```bash
+direnv allow
+just validate
+```
