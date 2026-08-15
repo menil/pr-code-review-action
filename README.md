@@ -31,13 +31,16 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Run Review Action
-        uses: orgname/pr-code-review-action@main
+        uses: menil/pr-code-review-action@v1
         with:
           openrouter_api_key: ${{ secrets.OPENROUTER_API_KEY }}
 ```
 
+> [!TIP]
+> This action is also available on the [GitHub Marketplace](https://github.com/marketplace/actions/pr-code-review-action). Pin to a release tag (e.g. `@v1`) rather than `@main` for stability.
+
 ### Private Repositories (Personal / Standalone Accounts)
-If the action repository is private and cannot be natively accessed, check it out dynamically using a Personal Access Token (PAT) with `repo` scope first:
+If you fork the action into a private repository (which cannot be natively referenced by public workflows), check it out dynamically using a Personal Access Token (PAT) with `repo` scope first:
 
 ```yaml
 name: Automated Code Review
