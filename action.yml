@@ -64,5 +64,5 @@ runs:
         GH_TOKEN: ${{ inputs.github_token }}
         POST_SUMMARY: ${{ inputs.post_summary }}
         EXCLUDE_PATTERNS: ${{ inputs.exclude_patterns }}
-      run: python ${{ github.action_path }}/pr_review.py
+      run: python ${{ github.action_path }}/src/pr_review.py
 

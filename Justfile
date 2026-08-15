@@ -1,15 +1,15 @@
 # ─── Lint ───────────────────────────────────────────────────
 lint:
-    ruff check pr_review.py tests/
-    mypy --strict pr_review.py tests/
+    ruff check src/pr_review.py tests/
+    mypy --strict src/pr_review.py tests/
 
 # ─── Format ─────────────────────────────────────────────────
 format:
-    ruff format pr_review.py tests/
+    ruff format src/pr_review.py tests/
 
 # ─── Check Format ───────────────────────────────────────────
 check-format:
-    ruff format --check pr_review.py tests/
+    ruff format --check src/pr_review.py tests/
 
 # ─── Test ───────────────────────────────────────────────────
 test:
