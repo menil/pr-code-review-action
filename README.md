@@ -77,10 +77,12 @@ jobs:
 | Input | Description | Required | Default |
 |-------|-------------|----------|---------|
 | `openrouter_api_key` | API key from OpenRouter | Yes | - |
-| `openrouter_model` | Model used for review | No | `google/gemma-4-26b-a4b-it:free` |
+| `openrouter_model` | Model used for review | No | `openrouter/free` |
 | `openrouter_base_url` | Base completions URL | No | `https://openrouter.ai/api/v1/chat/completions` |
 | `openrouter_max_tokens`| Max completion tokens | No | `4096` |
 | `github_token` | GitHub token for posting reviews | No | `${{ github.token }}` |
+| `post_summary` | Whether to post the high-level summary (PR-level overview of the review findings) as the review body | No | `true` |
+| `exclude_patterns` | Custom regex patterns to exclude from review, separated by commas and/or newlines | No | `''` |
 
 ## Development
 
