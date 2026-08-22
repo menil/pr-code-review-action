@@ -214,6 +214,10 @@ def filter_diff(diff_text: str, exclude_regexes: list[re.Pattern[str]]) -> str:
 def parse_llm_json(response_text: str) -> dict[str, Any]:
     """Parse JSON output from LLM, stripping markdown block wrappers or extracting the JSON block."""
     response_text = response_text.strip()
+    # Strip <think>...</think> blocks if present before parsing
+    response_text = re.sub(
+        r"<think>.*?</think>", "", response_text, flags=re.DOTALL | re.IGNORECASE
+    ).strip()
 
     def clean_json(text: str) -> str:
         # Replace trailing commas (ignoring those inside strings)
@@ -606,6 +610,10 @@ def make_openrouter_request(
         "max_tokens": max_tokens,
     }
 
+    # Add reasoning config if using OpenRouter to avoid reasoning tokens polluting content
+    if "openrouter.ai" in base_url.lower():
+        payload["reasoning"] = {"exclude": True}
+
     print(f"Requesting review from OpenRouter using model: {model} (JSON mode)...")
     try:
         return _send_request(base_url, payload, headers)
@@ -623,6 +631,7 @@ def make_openrouter_request(
             )
             payload_fallback = payload.copy()
             payload_fallback.pop("response_format", None)
+            payload_fallback.pop("reasoning", None)
             try:
                 return _send_request(base_url, payload_fallback, headers)
             except Exception as fallback_err:
