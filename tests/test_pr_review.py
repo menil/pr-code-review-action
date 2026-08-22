@@ -1279,3 +1279,25 @@ def test_make_openrouter_request_fallback_removes_reasoning(
     second_call_payload = mock_send_request.call_args_list[1][0][1]
     assert "response_format" not in second_call_payload
     assert "reasoning" not in second_call_payload
+
+
+def test_parse_llm_json_unescaped_quotes() -> None:
+    """Verify parse_llm_json correctly repairs and parses unescaped double quotes inside key values."""
+    # JSON with unescaped double quotes around "never drift" inside "body"
+    raw_broken = '{ "summary": "Review summary", "comments": [ { "path": "test.py", "line": 5, "body": "guarantee logic \\"never drift\\", these checks" } ] }'.replace(
+        '\\"', '"'
+    )
+
+    result = parse_llm_json(raw_broken)
+    assert (
+        result["comments"][0]["body"] == 'guarantee logic "never drift", these checks'
+    )
+
+    # Test with double quotes preceded by even number of backslashes (representing an escaped backslash followed by an unescaped quote)
+    # The JSON string literal: "This has a backslash \\ and an unescaped quote \"never drift\""
+    even_backslash_json = '{ "summary": "Review summary", "comments": [ { "path": "test.py", "line": 5, "body": "This has a backslash \\\\ and an unescaped quote \\\\"never drift\\\\"" } ] }'
+    result_even = parse_llm_json(even_backslash_json)
+    assert (
+        result_even["comments"][0]["body"]
+        == 'This has a backslash \\ and an unescaped quote \\"never drift\\"'
+    )
