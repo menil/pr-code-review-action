@@ -214,10 +214,25 @@ def filter_diff(diff_text: str, exclude_regexes: list[re.Pattern[str]]) -> str:
 def parse_llm_json(response_text: str) -> dict[str, Any]:
     """Parse JSON output from LLM, stripping markdown block wrappers or extracting the JSON block."""
     response_text = response_text.strip()
-    # Strip <think>...</think> blocks if present before parsing
-    response_text = re.sub(
-        r"<think>.*?</think>", "", response_text, flags=re.DOTALL | re.IGNORECASE
-    ).strip()
+
+    # Some reasoning models (e.g., DeepSeek-R1) output their chain of thought wrapped in <think> tags,
+    # even when configured for JSON mode. We strip these tags only if they appear before the actual
+    # JSON payload (determined by the first '{'), to prevent accidentally deleting <think> tags that
+    # are nested inside JSON string literal values (e.g., within code comments/documentation reviewed).
+    first_brace = response_text.find("{")
+    think_match = re.search(r"<think>", response_text, re.IGNORECASE)
+    if think_match and (first_brace == -1 or think_match.start() < first_brace):
+        # Locate corresponding close tag starting from the think block
+        end_match = re.search(
+            r"</think>", response_text[think_match.start() :], re.IGNORECASE
+        )
+        if end_match:
+            think_end = think_match.start() + end_match.end()
+            response_text = (
+                response_text[: think_match.start()] + response_text[think_end:]
+            ).strip()
+        # If no closing tag is found, we do not strip the think block because the brace-scanning
+        # logic below will naturally find and parse the actual JSON payload.
 
     def clean_json(text: str) -> str:
         # Replace trailing commas (ignoring those inside strings)
@@ -246,17 +261,23 @@ def parse_llm_json(response_text: str) -> dict[str, Any]:
         except json.JSONDecodeError:
             pass
 
-    # Extract block between the first '{' and the last '}'
-    first_brace = response_text.find("{")
+    # Find the last '}' which marks the end of the JSON object.
+    # Scan all '{' occurrences from left to right as possible starts of the JSON object,
+    # trying to parse from each candidate start_idx to the last_brace. This is highly robust
+    # against unclosed think tags, extra preambles, or curly braces inside a think/preamble block.
     last_brace = response_text.rfind("}")
-    if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
-        json_candidate = response_text[first_brace : last_brace + 1]
-        try:
-            result = json.loads(clean_json(json_candidate), strict=False)
-            if isinstance(result, dict):
-                return result
-        except json.JSONDecodeError:
-            pass
+    if last_brace != -1:
+        brace_indices = [i for i, char in enumerate(response_text) if char == "{"]
+        for start_idx in brace_indices:
+            if start_idx >= last_brace:
+                break
+            json_candidate = response_text[start_idx : last_brace + 1]
+            try:
+                result = json.loads(clean_json(json_candidate), strict=False)
+                if isinstance(result, dict):
+                    return result
+            except json.JSONDecodeError:
+                continue
 
     raise ValueError("No valid JSON object found in LLM response")
 
@@ -610,8 +631,10 @@ def make_openrouter_request(
         "max_tokens": max_tokens,
     }
 
-    # Add reasoning config if using OpenRouter to avoid reasoning tokens polluting content
-    if "openrouter.ai" in base_url.lower():
+    # Instruct OpenRouter to exclude reasoning tokens from the text response.
+    # This prevents reasoning text from polluting the returned completion string and
+    # consuming unnecessary token limits when only the final JSON is required.
+    if base_url and "openrouter.ai" in base_url.lower():
         payload["reasoning"] = {"exclude": True}
 
     print(f"Requesting review from OpenRouter using model: {model} (JSON mode)...")
@@ -631,6 +654,8 @@ def make_openrouter_request(
             )
             payload_fallback = payload.copy()
             payload_fallback.pop("response_format", None)
+            # Remove the OpenRouter-specific reasoning parameter to prevent API validation errors (HTTP 400/422)
+            # when attempting a non-strict fallback call or when using non-OpenRouter endpoints.
             payload_fallback.pop("reasoning", None)
             try:
                 return _send_request(base_url, payload_fallback, headers)

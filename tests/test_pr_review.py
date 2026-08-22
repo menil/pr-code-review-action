@@ -438,7 +438,7 @@ def test_parse_markdown_comments() -> None:
     markdown_text = """
     We will go through the passes.
 
-    - In app.rs:
+    - In APP.RS:
      - Line 81: `current_dir: start_path.canonicalize()`
        This is acceptable because...
        It should handle error.
@@ -446,7 +446,7 @@ def test_parse_markdown_comments() -> None:
      - Lines 103: self.entries = list_dir()
        This is okay.
 
-    ### Review for fs.rs
+    ### Review for Fs.rs
     - Line 42-44: split_name_ext
       This is a good helper function.
     """
@@ -1157,6 +1157,72 @@ thoughts
 }"""
     result_upper = parse_llm_json(thinking_str_upper)
     assert result_upper["summary"] == "real output upper"
+
+    # Test unclosed <think> tag (e.g. truncated response)
+    thinking_str_unclosed = """<think>
+thoughts with curly { braces } inside it
+and some more text
+{
+  "summary": "real output unclosed",
+  "comments": []
+}"""
+    result_unclosed = parse_llm_json(thinking_str_unclosed)
+    assert result_unclosed["summary"] == "real output unclosed"
+
+    # Test that <think> tags nested inside JSON string values are preserved and NOT stripped
+    nested_str = (
+        '{"summary": "Review for <think>tags</think> in comments.", "comments": []}'
+    )
+    result_nested = parse_llm_json(nested_str)
+    assert result_nested["summary"] == "Review for <think>tags</think> in comments."
+
+
+def test_parse_llm_json_preamble_extraction() -> None:
+    """Verify parse_llm_json extracts valid JSON when surrounded by text and extra braces."""
+    text = """Here is some preamble with a {dummy} brace.
+    {
+        "summary": "success",
+        "comments": []
+    }
+    And some trailing text."""
+    result = parse_llm_json(text)
+    assert result["summary"] == "success"
+    assert result["comments"] == []
+
+
+def test_calculate_backoff() -> None:
+    """Verify that _calculate_backoff computes delay correctly, respects retry_after, and caps at 60.0."""
+    from pr_review import _calculate_backoff
+
+    # 1. Exponential increase with attempts
+    delay_0 = _calculate_backoff(attempt=0, base_delay=1.0)
+    delay_1 = _calculate_backoff(attempt=1, base_delay=1.0)
+    delay_2 = _calculate_backoff(attempt=2, base_delay=1.0)
+
+    # Allow for jitter (0.1 to 1.0 seconds)
+    # base_delay * (2**0) + jitter => 1.0 + [0.1, 1.0] => [1.1, 2.0]
+    # base_delay * (2**1) + jitter => 2.0 + [0.1, 1.0] => [2.1, 3.0]
+    # base_delay * (2**2) + jitter => 4.0 + [0.1, 1.0] => [4.1, 5.0]
+    assert 1.1 <= delay_0 <= 2.0
+    assert 2.1 <= delay_1 <= 3.0
+    assert 4.1 <= delay_2 <= 5.0
+
+    # 2. respects retry_after parameter if it is larger than computed backoff
+    delay_ra_large = _calculate_backoff(attempt=1, base_delay=1.0, retry_after=10.0)
+    assert delay_ra_large == 10.0
+
+    # retry_after is ignored if it is smaller than computed backoff
+    delay_ra_small = _calculate_backoff(attempt=2, base_delay=1.0, retry_after=1.0)
+    assert 4.1 <= delay_ra_small <= 5.0
+
+    # 3. capped at 60.0 seconds
+    delay_capped = _calculate_backoff(attempt=10, base_delay=1.0)
+    # 1.0 * (2**10) = 1024. But it should be capped at 60.0
+    assert delay_capped == 60.0
+
+    # custom retry_after larger than 60.0 is also capped at 60.0
+    delay_capped_ra = _calculate_backoff(attempt=1, base_delay=1.0, retry_after=120.0)
+    assert delay_capped_ra == 60.0
 
 
 @patch("pr_review._send_request")
