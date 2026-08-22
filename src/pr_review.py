@@ -49,6 +49,10 @@ DEFAULT_EXCLUDE_PATTERNS = [
 
 # Pre-compiled regular expressions for efficiency
 JSON_CLEAN_RE = re.compile(r'("(?:\\.|[^"\\])*")|,(\s*[}\]])')
+CLEAN_FIELDS_RE = re.compile(
+    r'("(?:thinking|summary|path|body)"\s*:\s*")(.*?)("\s*(?=,\s*"[^"]+"\s*:|,?\s*\}))',
+    flags=re.DOTALL | re.IGNORECASE,
+)
 
 MD_HEADER_RE = re.compile(r"^#+\s*")
 MD_LIST_RE = re.compile(r"^[-*+]\s+")
@@ -212,7 +216,15 @@ def filter_diff(diff_text: str, exclude_regexes: list[re.Pattern[str]]) -> str:
 
 
 def parse_llm_json(response_text: str) -> dict[str, Any]:
-    """Parse JSON output from LLM, stripping markdown block wrappers or extracting the JSON block."""
+    """Parse, clean, and extract JSON output from the LLM.
+
+    This function performs the following steps:
+    1. Case-insensitively strips <think>...</think> blocks if they appear before the main JSON object.
+    2. Repairs invalid JSON payloads by escaping unescaped double quotes within targeted key fields
+       (e.g., 'thinking', 'summary', 'path', 'body') and cleaning up trailing commas.
+    3. Extracts and parses candidate JSON substrings using a robust brace-scanning fallback to tolerate
+       unclosed think blocks, extra preambles, or mismatched nested braces.
+    """
     response_text = response_text.strip()
 
     # Some reasoning models (e.g., DeepSeek-R1) output their chain of thought wrapped in <think> tags,
@@ -235,6 +247,20 @@ def parse_llm_json(response_text: str) -> dict[str, Any]:
         # logic below will naturally find and parse the actual JSON payload.
 
     def clean_json(text: str) -> str:
+        # Escape any unescaped double quotes inside key-value string values in a single pass
+        # to prevent JSON parsing crashes when models output unescaped quotes inside their feedback.
+        text = CLEAN_FIELDS_RE.sub(
+            lambda m: (
+                str(m.group(1))
+                + re.sub(
+                    r'(?<!\\)(?:\\\\)*"',
+                    lambda sm: str(sm.group(0))[:-1] + r"\"",
+                    str(m.group(2)),
+                )
+                + str(m.group(3))
+            ),
+            text,
+        )
         # Replace trailing commas (ignoring those inside strings)
         return JSON_CLEAN_RE.sub(lambda m: m.group(1) or m.group(2), text)
 
