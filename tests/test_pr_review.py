@@ -1116,3 +1116,100 @@ def test_main_fallback_warning_on_json_parse_failure_post_summary_false(
     assert "could not be parsed as a JSON object" in args[3]
     assert "workflow execution logs" in args[3]
     assert "No issues found" not in args[3]
+
+
+def test_parse_llm_json_with_thinking() -> None:
+    """Verify parse_llm_json correctly strips <think>...</think> blocks case-insensitively."""
+    thinking_str = """<think>
+Some thoughts about code review.
+Let's mock JSON:
+{
+  "dummy": "this is a fake json inside think block"
+}
+Okay, now the real JSON:
+</think>
+{
+  "summary": "real output",
+  "comments": []
+}"""
+    result = parse_llm_json(thinking_str)
+    assert result["summary"] == "real output"
+    assert result["comments"] == []
+
+    # Test lowercase <think>
+    thinking_str_lower = """<think>
+thoughts
+</think>
+{
+  "summary": "real output lower",
+  "comments": []
+}"""
+    result_lower = parse_llm_json(thinking_str_lower)
+    assert result_lower["summary"] == "real output lower"
+
+    # Test uppercase <Think>
+    thinking_str_upper = """<Think>
+thoughts
+</THINK>
+{
+  "summary": "real output upper",
+  "comments": []
+}"""
+    result_upper = parse_llm_json(thinking_str_upper)
+    assert result_upper["summary"] == "real output upper"
+
+
+@patch("pr_review._send_request")
+def test_make_openrouter_request_reasoning_exclude(
+    mock_send_request: MagicMock,
+) -> None:
+    """Verify that make_openrouter_request includes or excludes 'reasoning' based on base_url."""
+    from pr_review import make_openrouter_request
+
+    # 1. Base URL is OpenRouter -> includes reasoning: exclude: True
+    mock_send_request.return_value = '{"summary": "Review complete"}'
+    make_openrouter_request(
+        "fake_key",
+        "fake_diff",
+        base_url="https://openrouter.ai/api/v1/chat/completions",
+    )
+    mock_send_request.assert_called_once()
+    payload = mock_send_request.call_args[0][1]
+    assert payload["reasoning"] == {"exclude": True}
+
+    # 2. Base URL is non-OpenRouter -> does NOT include reasoning config
+    mock_send_request.reset_mock()
+    make_openrouter_request(
+        "fake_key", "fake_diff", base_url="https://api.openai.com/v1/chat/completions"
+    )
+    mock_send_request.assert_called_once()
+    payload = mock_send_request.call_args[0][1]
+    assert "reasoning" not in payload
+
+
+@patch("pr_review._send_request")
+def test_make_openrouter_request_fallback_removes_reasoning(
+    mock_send_request: MagicMock,
+) -> None:
+    """Verify that make_openrouter_request fallback removes 'reasoning' from the retry payload."""
+    from pr_review import make_openrouter_request
+
+    # Side effect: first call raises ValueError (triggering fallback), second call succeeds
+    mock_send_request.side_effect = [
+        ValueError("First call failed"),
+        '{"summary": "Fallback works"}',
+    ]
+
+    result = make_openrouter_request(
+        "fake_key",
+        "fake_diff",
+        base_url="https://openrouter.ai/api/v1/chat/completions",
+    )
+
+    assert result == '{"summary": "Fallback works"}'
+    assert mock_send_request.call_count == 2
+
+    # Second call payload should have both 'response_format' and 'reasoning' popped
+    second_call_payload = mock_send_request.call_args_list[1][0][1]
+    assert "response_format" not in second_call_payload
+    assert "reasoning" not in second_call_payload
