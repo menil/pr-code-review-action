@@ -215,17 +215,59 @@ def filter_diff(diff_text: str, exclude_regexes: list[re.Pattern[str]]) -> str:
     return "".join(filtered_lines)
 
 
+def repair_truncated_json(text: str) -> str:
+    """Attempt to repair a truncated JSON string by closing open quotes, brackets, and braces."""
+    in_string = False
+    escape = False
+    stack = []
+
+    for char in text:
+        if in_string:
+            if escape:
+                escape = False
+                continue
+            if char == "\\":
+                escape = True
+                continue
+            if char == '"':
+                in_string = False
+                continue
+        else:
+            if char == '"':
+                in_string = True
+                continue
+            if char == "{":
+                stack.append("}")
+            elif char == "[":
+                stack.append("]")
+            elif char == "}":
+                if stack and stack[-1] == "}":
+                    stack.pop()
+            elif char == "]":
+                if stack and stack[-1] == "]":
+                    stack.pop()
+
+    repaired = text
+    if in_string:
+        repaired += '"'
+    while stack:
+        repaired += stack.pop()
+    return repaired
+
+
 def parse_llm_json(response_text: str) -> dict[str, Any]:
     """Parse, clean, and extract JSON output from the LLM.
 
     This function performs the following steps:
-    1. Case-insensitively strips <think>...</think> blocks if they appear before the main JSON object.
-    2. Repairs invalid JSON payloads by escaping unescaped double quotes within targeted key fields
+    1. Repairs truncated JSON payloads by automatically closing open quotes, brackets, and braces.
+    2. Case-insensitively strips <think>...</think> blocks if they appear before the main JSON object.
+    3. Repairs invalid JSON payloads by escaping unescaped double quotes within targeted key fields
        (e.g., 'thinking', 'summary', 'path', 'body') and cleaning up trailing commas.
-    3. Extracts and parses candidate JSON substrings using a robust brace-scanning fallback to tolerate
+    4. Extracts and parses candidate JSON substrings using a robust brace-scanning fallback to tolerate
        unclosed think blocks, extra preambles, or mismatched nested braces.
     """
     response_text = response_text.strip()
+    response_text = repair_truncated_json(response_text)
 
     # Some reasoning models (e.g., DeepSeek-R1) output their chain of thought wrapped in <think> tags,
     # even when configured for JSON mode. We strip these tags only if they appear before the actual
