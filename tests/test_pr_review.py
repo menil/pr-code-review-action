@@ -1301,3 +1301,20 @@ def test_parse_llm_json_unescaped_quotes() -> None:
         result_even["comments"][0]["body"]
         == 'This has a backslash \\ and an unescaped quote \\"never drift\\"'
     )
+
+
+def test_parse_llm_json_truncated() -> None:
+    """Verify parse_llm_json correctly repairs and parses truncated JSON."""
+    truncated_str = """{
+  "thinking": "Pass 1: ...",
+  "summary": "This is a block. The identical 14-line block"""
+    result = parse_llm_json(truncated_str)
+    assert result["summary"] == "This is a block. The identical 14-line block"
+    assert "comments" not in result
+
+    # Test backslash outside of JSON string values (e.g., in a preamble)
+    backslash_outside_json = 'Here is a backslash: \\ and then the JSON: { "summary": "valid summary with unescaped quote \\"never drift\\"" }'
+    result_outside = parse_llm_json(backslash_outside_json)
+    assert (
+        result_outside["summary"] == 'valid summary with unescaped quote "never drift"'
+    )

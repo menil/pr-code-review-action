@@ -20,7 +20,7 @@ inputs:
   openrouter_max_tokens:
     description: 'Maximum tokens for LLM response'
     required: false
-    default: '4096'
+    default: '8192'
   github_token:
     description: 'GITHUB_TOKEN for posting review comments'
     required: false
