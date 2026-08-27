@@ -1318,3 +1318,405 @@ def test_parse_llm_json_truncated() -> None:
     assert (
         result_outside["summary"] == 'valid summary with unescaped quote "never drift"'
     )
+
+
+# ---------------------------------------------------------------------------
+# Anthropic (Messages API) provider tests
+# ---------------------------------------------------------------------------
+
+
+@patch("pr_review.urllib.request.urlopen")
+def test_send_request_anthropic_success(mock_urlopen: MagicMock) -> None:
+    from pr_review import _send_request
+
+    mock_res = MagicMock()
+    mock_res.read.return_value = json.dumps(
+        {
+            "content": [{"type": "text", "text": '{"summary": "OK"}'}],
+            "stop_reason": "end_turn",
+        }
+    ).encode("utf-8")
+    mock_urlopen.return_value.__enter__.return_value = mock_res
+
+    content = _send_request(
+        url="http://dummy",
+        payload={"dummy": "data"},
+        headers={"x-api-key": "key"},
+        provider="anthropic",
+    )
+    assert content == '{"summary": "OK"}'
+
+
+@patch("pr_review.urllib.request.urlopen")
+def test_send_request_anthropic_concatenates_text_blocks(
+    mock_urlopen: MagicMock,
+) -> None:
+    from pr_review import _send_request
+
+    # Non-text blocks (e.g. thinking) are ignored; text blocks are concatenated in order.
+    mock_res = MagicMock()
+    mock_res.read.return_value = json.dumps(
+        {
+            "content": [
+                {"type": "thinking", "thinking": "reasoning..."},
+                {"type": "text", "text": '{"summary":'},
+                {"type": "text", "text": ' "joined"}'},
+            ],
+            "stop_reason": "end_turn",
+        }
+    ).encode("utf-8")
+    mock_urlopen.return_value.__enter__.return_value = mock_res
+
+    content = _send_request("http://dummy", {}, {}, provider="anthropic")
+    assert content == '{"summary": "joined"}'
+
+
+@patch("pr_review.urllib.request.urlopen")
+def test_send_request_anthropic_error_body(mock_urlopen: MagicMock) -> None:
+    from pr_review import _send_request
+
+    mock_res = MagicMock()
+    mock_res.read.return_value = (
+        b'{"type": "error", "error": {"type": "invalid_request_error",'
+        b' "message": "model not found"}}'
+    )
+    mock_urlopen.return_value.__enter__.return_value = mock_res
+
+    with pytest.raises(ValueError, match="Anthropic Error: model not found"):
+        _send_request("http://dummy", {}, {}, provider="anthropic")
+
+
+@patch("pr_review.urllib.request.urlopen")
+def test_send_request_anthropic_refusal(mock_urlopen: MagicMock) -> None:
+    from pr_review import _send_request
+
+    mock_res = MagicMock()
+    mock_res.read.return_value = b'{"content": [], "stop_reason": "refusal"}'
+    mock_urlopen.return_value.__enter__.return_value = mock_res
+
+    with pytest.raises(ValueError, match="Anthropic refused to process"):
+        _send_request("http://dummy", {}, {}, provider="anthropic")
+
+
+@patch("pr_review.urllib.request.urlopen")
+def test_send_request_anthropic_empty_content(mock_urlopen: MagicMock) -> None:
+    from pr_review import _send_request
+
+    mock_res = MagicMock()
+    mock_res.read.return_value = b'{"content": [], "stop_reason": "end_turn"}'
+    mock_urlopen.return_value.__enter__.return_value = mock_res
+
+    with pytest.raises(ValueError, match="Anthropic returned empty content"):
+        _send_request("http://dummy", {}, {}, provider="anthropic")
+
+
+@patch("pr_review.urllib.request.urlopen")
+def test_send_request_anthropic_no_text_block(mock_urlopen: MagicMock) -> None:
+    from pr_review import _send_request
+
+    mock_res = MagicMock()
+    mock_res.read.return_value = (
+        b'{"content": [{"type": "thinking", "thinking": "..."}],'
+        b' "stop_reason": "end_turn"}'
+    )
+    mock_urlopen.return_value.__enter__.return_value = mock_res
+
+    with pytest.raises(ValueError, match="Anthropic returned no text content"):
+        _send_request("http://dummy", {}, {}, provider="anthropic")
+
+
+@patch("time.sleep")
+@patch("pr_review.urllib.request.urlopen")
+def test_send_request_anthropic_http_error(
+    mock_urlopen: MagicMock, mock_sleep: MagicMock
+) -> None:
+    import urllib.error
+    from pr_review import _send_request
+
+    mock_headers = MagicMock()
+    fp = MagicMock()
+    fp.read.return_value = b"Bad Request details"
+    http_err = urllib.error.HTTPError(
+        "http://dummy", 400, "Bad Request", mock_headers, fp
+    )
+    mock_urlopen.side_effect = http_err
+
+    with pytest.raises(ValueError) as excinfo:
+        _send_request("http://dummy", {}, {}, provider="anthropic")
+
+    assert "Anthropic HTTP Error 400: Bad Request details" in str(excinfo.value)
+
+
+@patch("pr_review._send_request")
+def test_make_anthropic_request_success(mock_send_request: MagicMock) -> None:
+    from pr_review import make_anthropic_request
+
+    mock_send_request.return_value = '{"summary": "Review complete"}'
+
+    result = make_anthropic_request("fake_key", "fake_diff")
+
+    assert result == '{"summary": "Review complete"}'
+    mock_send_request.assert_called_once()
+    args, kwargs = mock_send_request.call_args
+    payload = args[1]
+    headers = args[2]
+    # Anthropic uses a top-level system prompt and no OpenRouter-specific params.
+    assert kwargs.get("provider") == "anthropic"
+    assert payload["model"] == "claude-haiku-4-5"
+    assert "system" in payload
+    assert "response_format" not in payload
+    assert "temperature" not in payload
+    assert "reasoning" not in payload
+    assert payload["messages"][0]["role"] == "user"
+    assert headers["x-api-key"] == "fake_key"
+    assert headers["anthropic-version"] == "2023-06-01"
+
+
+@patch("pr_review._send_request")
+def test_make_anthropic_request_comments_only(mock_send_request: MagicMock) -> None:
+    from pr_review import make_anthropic_request
+
+    mock_send_request.return_value = '{"comments": []}'
+
+    result = make_anthropic_request("fake_key", "fake_diff", post_summary=False)
+
+    assert result == '{"comments": []}'
+    payload = mock_send_request.call_args[0][1]
+    system_msg = payload["system"]
+    # The comments-only instruction file omits the "thinking" pass workflow.
+    assert "comments" in system_msg
+    assert "thinking" not in system_msg
+
+
+@patch("pr_review._send_request")
+def test_make_anthropic_request_oauth_headers(mock_send_request: MagicMock) -> None:
+    """A Claude Pro/Max OAuth token authenticates via Bearer + the oauth beta header."""
+    from pr_review import make_anthropic_request
+
+    mock_send_request.return_value = '{"summary": "Review complete"}'
+
+    make_anthropic_request("fake_oauth_token", "fake_diff", use_oauth=True)
+
+    args, kwargs = mock_send_request.call_args
+    payload = args[1]
+    headers = args[2]
+    assert kwargs.get("provider") == "anthropic"
+    assert headers["Authorization"] == "Bearer fake_oauth_token"
+    assert headers["anthropic-beta"] == "oauth-2025-04-20"
+    assert "x-api-key" not in headers
+    # OAuth-authenticated requests must open with Claude Code's own identity line.
+    assert payload["system"].startswith(
+        "You are Claude Code, Anthropic's official CLI for Claude."
+    )
+
+
+@patch("pr_review._send_request")
+def test_make_anthropic_request_api_key_no_oauth_beta_header(
+    mock_send_request: MagicMock,
+) -> None:
+    """A plain API key must not carry the OAuth beta header or identity prefix."""
+    from pr_review import make_anthropic_request
+
+    mock_send_request.return_value = '{"summary": "Review complete"}'
+
+    make_anthropic_request("fake_key", "fake_diff", use_oauth=False)
+
+    args, _kwargs = mock_send_request.call_args
+    payload = args[1]
+    headers = args[2]
+    assert "anthropic-beta" not in headers
+    assert "Authorization" not in headers
+    assert not payload["system"].startswith("You are Claude Code")
+
+
+@patch.dict(
+    "os.environ",
+    {
+        "PROVIDER": "anthropic",
+        "ANTHROPIC_API_KEY": "fake_key",
+        "PR_NUMBER": "12",
+        "REPO": "owner/repo",
+        "GH_TOKEN": "fake_github_token",
+        "POST_SUMMARY": "true",
+    },
+    clear=True,
+)
+@patch("os.path.exists")
+@patch("builtins.open")
+@patch("pr_review.make_anthropic_request")
+@patch("pr_review.submit_github_review")
+def test_main_success_anthropic_provider(
+    mock_submit: MagicMock,
+    mock_make_req: MagicMock,
+    mock_open: MagicMock,
+    mock_exists: MagicMock,
+) -> None:
+    """Verify main() dispatches to the Anthropic provider when PROVIDER=anthropic."""
+    from pr_review import main
+
+    mock_exists.return_value = True
+
+    mock_file = MagicMock()
+    mock_file.read.return_value = """diff --git a/test.py b/test.py
+--- a/test.py
++++ b/test.py
+@@ -1,5 +1,5 @@
+ line1
+ line2
+ line3
+ line4
++line5
+"""
+    mock_open.return_value.__enter__.return_value = mock_file
+
+    json_response = {
+        "summary": "Looks good!",
+        "comments": [{"path": "test.py", "line": 5, "body": "Nice change"}],
+    }
+    mock_make_req.return_value = json.dumps(json_response)
+
+    main()
+
+    mock_make_req.assert_called_once()
+    mock_submit.assert_called_once()
+    args = mock_submit.call_args[0]
+    assert args[4][0]["side"] == "RIGHT"
+
+
+@patch.dict(
+    "os.environ",
+    {
+        "PROVIDER": "anthropic",
+        "CLAUDE_CODE_OAUTH_TOKEN": "fake_oauth_token",
+        "PR_NUMBER": "12",
+        "REPO": "owner/repo",
+        "GH_TOKEN": "fake_github_token",
+        "POST_SUMMARY": "true",
+    },
+    clear=True,
+)
+@patch("os.path.exists")
+@patch("builtins.open")
+@patch("pr_review.make_anthropic_request")
+@patch("pr_review.submit_github_review")
+def test_main_success_anthropic_provider_oauth_only(
+    mock_submit: MagicMock,
+    mock_make_req: MagicMock,
+    mock_open: MagicMock,
+    mock_exists: MagicMock,
+) -> None:
+    """Verify main() falls back to CLAUDE_CODE_OAUTH_TOKEN when no API key is set."""
+    from pr_review import main
+
+    mock_exists.return_value = True
+
+    mock_file = MagicMock()
+    mock_file.read.return_value = """diff --git a/test.py b/test.py
+--- a/test.py
++++ b/test.py
+@@ -1,5 +1,5 @@
+ line1
+ line2
+ line3
+ line4
++line5
+"""
+    mock_open.return_value.__enter__.return_value = mock_file
+
+    mock_make_req.return_value = json.dumps({"summary": "Looks good!", "comments": []})
+
+    main()
+
+    mock_make_req.assert_called_once()
+    kwargs = mock_make_req.call_args.kwargs
+    assert kwargs["api_key"] == "fake_oauth_token"
+    assert kwargs["use_oauth"] is True
+    mock_submit.assert_called_once()
+
+
+@patch.dict(
+    "os.environ",
+    {
+        "PROVIDER": "anthropic",
+        "ANTHROPIC_API_KEY": "fake_key",
+        "CLAUDE_CODE_OAUTH_TOKEN": "fake_oauth_token",
+        "PR_NUMBER": "12",
+        "REPO": "owner/repo",
+        "GH_TOKEN": "fake_github_token",
+        "POST_SUMMARY": "true",
+    },
+    clear=True,
+)
+@patch("os.path.exists")
+@patch("builtins.open")
+@patch("pr_review.make_anthropic_request")
+@patch("pr_review.submit_github_review")
+def test_main_anthropic_oauth_takes_precedence_over_api_key(
+    mock_submit: MagicMock,
+    mock_make_req: MagicMock,
+    mock_open: MagicMock,
+    mock_exists: MagicMock,
+) -> None:
+    """When both credentials are set, CLAUDE_CODE_OAUTH_TOKEN wins over the billed API key."""
+    from pr_review import main
+
+    mock_exists.return_value = True
+
+    mock_file = MagicMock()
+    mock_file.read.return_value = """diff --git a/test.py b/test.py
+--- a/test.py
++++ b/test.py
+@@ -1,5 +1,5 @@
+ line1
+ line2
+ line3
+ line4
++line5
+"""
+    mock_open.return_value.__enter__.return_value = mock_file
+
+    mock_make_req.return_value = json.dumps({"summary": "Looks good!", "comments": []})
+
+    main()
+
+    kwargs = mock_make_req.call_args.kwargs
+    assert kwargs["api_key"] == "fake_oauth_token"
+    assert kwargs["use_oauth"] is True
+
+
+def test_main_invalid_provider() -> None:
+    """Verify main() exits with 1 when PROVIDER is not a supported value."""
+    from pr_review import main
+
+    with patch.dict(
+        "os.environ",
+        {
+            "PROVIDER": "bogus",
+            "PR_NUMBER": "12",
+            "REPO": "owner/repo",
+            "GH_TOKEN": "fake_token",
+        },
+        clear=True,
+    ):
+        with pytest.raises(SystemExit) as excinfo:
+            main()
+        assert excinfo.value.code == 1
+
+
+def test_main_missing_anthropic_key() -> None:
+    """Verify main() exits with 1 when PROVIDER=anthropic but neither credential is set."""
+    from pr_review import main
+
+    with patch.dict(
+        "os.environ",
+        {
+            "PROVIDER": "anthropic",
+            "PR_NUMBER": "12",
+            "REPO": "owner/repo",
+            "GH_TOKEN": "fake_token",
+        },
+        clear=True,
+    ):
+        with pytest.raises(SystemExit) as excinfo:
+            main()
+        assert excinfo.value.code == 1

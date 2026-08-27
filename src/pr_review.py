@@ -505,19 +505,27 @@ def _calculate_backoff(
     return float(min(delay, 60.0))
 
 
-def _send_request(url: str, payload: dict[str, Any], headers: dict[str, str]) -> str:
-    """Send HTTP request to OpenRouter and handle errors/timeouts.
+def _send_request(
+    url: str,
+    payload: dict[str, Any],
+    headers: dict[str, str],
+    provider: str = "openrouter",
+) -> str:
+    """Send an HTTP request to the configured LLM provider and handle errors/timeouts.
 
     Args:
-        url: The target OpenRouter API endpoint URL.
+        url: The target completions/messages API endpoint URL.
         payload: The request body containing model instructions and settings.
-        headers: Dict containing headers (Authorization, X-Title, etc.).
+        headers: Provider-specific headers (Authorization for OpenRouter, x-api-key for Anthropic).
+        provider: Which response schema to parse — "openrouter" (OpenAI-compatible chat
+            completions) or "anthropic" (Messages API).
 
     Returns:
-        The raw text content returned in the model's chat completion choice.
+        The text content returned by the model (chat completion choice for OpenRouter,
+        concatenated text blocks for Anthropic).
 
     Raises:
-        ValueError: If the response is empty, malformed, missing message content, or on HTTPError.
+        ValueError: If the response is empty, malformed, a refusal, or on HTTPError.
         urllib.error.URLError: If connection/DNS resolution fails and retries are exhausted.
         TimeoutError: If request times out and retries are exhausted.
     """
@@ -535,6 +543,53 @@ def _send_request(url: str, payload: dict[str, Any], headers: dict[str, str]) ->
                     "utf-8", errors="replace"
                 )
                 res_data = json.loads(res_content)
+
+                if provider == "anthropic":
+                    # The Anthropic API signals failures with HTTP status codes (handled in the
+                    # except blocks below), but defensively handle an error object returned with
+                    # a 200 status as well.
+                    if isinstance(res_data, dict) and res_data.get("type") == "error":
+                        err = res_data.get("error")
+                        err_msg = (
+                            str(err.get("message") or "")
+                            if isinstance(err, dict)
+                            else str(err)
+                        )
+                        raise ValueError(f"Anthropic Error: {err_msg}")
+
+                    # Safety classifiers may decline a request with HTTP 200, stop_reason
+                    # "refusal", and no usable content. Surface it so the attempt retries/fails.
+                    if res_data.get("stop_reason") == "refusal":
+                        raise ValueError(
+                            "Anthropic refused to process the request (stop_reason: refusal)."
+                        )
+
+                    content_blocks = res_data.get("content", [])
+                    if not content_blocks:
+                        truncated_res = (
+                            res_content[:1000] + "..."
+                            if len(res_content) > 1000
+                            else res_content
+                        )
+                        raise ValueError(
+                            f"Anthropic returned empty content. Full response: {truncated_res}"
+                        )
+
+                    # Concatenate every text block; non-text blocks (e.g. thinking) are ignored.
+                    text_parts = [
+                        block["text"]
+                        for block in content_blocks
+                        if isinstance(block, dict)
+                        and block.get("type") == "text"
+                        and isinstance(block.get("text"), str)
+                    ]
+                    if not text_parts:
+                        raise ValueError(
+                            f"Anthropic returned no text content. Full response: {res_content}"
+                        )
+                    return "".join(text_parts)
+
+                # Default provider: OpenRouter (OpenAI-compatible chat completions).
                 if isinstance(res_data, dict) and "error" in res_data:
                     err = res_data["error"]
                     err_msg = (
@@ -627,7 +682,10 @@ def _send_request(url: str, payload: dict[str, Any], headers: dict[str, str]) ->
             else:
                 if not err_body:
                     err_body = "<could not read HTTP error body>"
-                raise ValueError(f"OpenRouter HTTP Error {e.code}: {err_body}") from e
+                provider_name = "Anthropic" if provider == "anthropic" else "OpenRouter"
+                raise ValueError(
+                    f"{provider_name} HTTP Error {e.code}: {err_body}"
+                ) from e
         except (urllib.error.URLError, TimeoutError) as e:
             # Network drops and timeouts are transient issues; retry them
             if attempt < max_retries:
@@ -737,6 +795,92 @@ def make_openrouter_request(
             raise
 
 
+def make_anthropic_request(
+    api_key: str,
+    diff_content: str,
+    post_summary: bool = True,
+    model: str = "claude-haiku-4-5",
+    base_url: str = "https://api.anthropic.com/v1/messages",
+    max_tokens: int = 8192,
+    use_oauth: bool = False,
+) -> str:
+    """Call the Anthropic Messages API to review the diff content using the specified model.
+
+    Args:
+        api_key: An Anthropic API key, or (when use_oauth is True) a Claude Pro/Max
+            subscription OAuth token generated via `claude setup-token`.
+        use_oauth: When True, authenticate the way the Claude Code CLI does for
+            subscription auth: a Bearer token plus the "oauth-2025-04-20" beta header,
+            instead of the standard x-api-key header used for billed API keys.
+    """
+    if use_oauth:
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "anthropic-version": "2023-06-01",
+            "anthropic-beta": "oauth-2025-04-20",
+            "content-type": "application/json",
+        }
+    else:
+        headers = {
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    instruction_file = (
+        "system_instruction.md"
+        if post_summary
+        else "system_instruction_comments_only.md"
+    )
+    instruction_path = os.path.join(script_dir, instruction_file)
+    try:
+        with open(instruction_path, "r", encoding="utf-8") as f:
+            system_instruction = f.read()
+    except Exception as e:
+        print(f"Error reading {instruction_file}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if use_oauth:
+        # Anthropic scopes Claude Pro/Max OAuth tokens to the Claude Code product: the API
+        # rejects OAuth-authenticated requests unless the system prompt opens with Claude
+        # Code's own identity line, so it must be prepended ahead of our review instructions.
+        system_instruction = (
+            "You are Claude Code, Anthropic's official CLI for Claude.\n\n"
+            + system_instruction
+        )
+
+    annotated_diff = annotate_diff(diff_content)
+
+    # The Anthropic Messages API takes the system prompt as a top-level field (not a message)
+    # and does not accept a JSON-mode response_format flag, so the JSON contract is enforced
+    # entirely through the prompt and validated by parse_llm_json. `temperature` is intentionally
+    # omitted: it is rejected with HTTP 400 on the Opus 4.x / Sonnet 5 tiers, so leaving it unset
+    # keeps the action working across any configured Claude model.
+    payload = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "system": system_instruction,
+        "messages": [
+            {
+                "role": "user",
+                "content": (
+                    f"Please review this annotated diff:\n\n{annotated_diff}\n\n"
+                    "CRITICAL: You must respond ONLY with a valid JSON object matching the schema. "
+                    "Do not include any introductory or concluding text, markdown wrappers, "
+                    "or any content outside of the JSON object itself."
+                ),
+            },
+        ],
+    }
+
+    auth_desc = "Claude Pro/Max OAuth token" if use_oauth else "API key"
+    print(
+        f"Requesting review from Anthropic using model: {model} (auth: {auth_desc})..."
+    )
+    return _send_request(base_url, payload, headers, provider="anthropic")
+
+
 def submit_github_review(
     repo: str, pr_number: str, token: str, summary: str, comments: list[dict[str, Any]]
 ) -> dict[str, Any]:
@@ -778,19 +922,47 @@ def submit_github_review(
 def main() -> None:
     """Validate environment configurations, process diff content, and submit review."""
     # Load and validate environment variables
-    api_key = os.environ.get("OPENROUTER_API_KEY")
+    provider = os.environ.get("PROVIDER", "openrouter").strip().lower()
     pr_number = os.environ.get("PR_NUMBER")
     repo = os.environ.get("REPO")
     token = os.environ.get("GH_TOKEN")
     post_summary_env = os.environ.get("POST_SUMMARY", "true")
     post_summary = post_summary_env.lower() in ("true", "1", "yes")
 
-    if not api_key:
+    if provider not in ("openrouter", "anthropic"):
         print(
-            "Error: OPENROUTER_API_KEY environment variable is required.",
+            f"Error: PROVIDER must be 'openrouter' or 'anthropic', got '{provider}'.",
             file=sys.stderr,
         )
         sys.exit(1)
+
+    # Each provider reads its own credentials so all of them can be configured side by side.
+    use_oauth = False
+    if provider == "anthropic":
+        # The Anthropic provider accepts either a billed API key or a Claude Pro/Max
+        # subscription OAuth token (from `claude setup-token`). The OAuth token takes
+        # precedence when both are set, so a configured Claude Code subscription is
+        # preferred over a billed API key.
+        api_key = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
+        use_oauth = bool(api_key)
+        if not api_key:
+            api_key = os.environ.get("ANTHROPIC_API_KEY")
+
+        if not api_key:
+            print(
+                "Error: provider is 'anthropic' but neither ANTHROPIC_API_KEY nor "
+                "CLAUDE_CODE_OAUTH_TOKEN environment variable is set.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    else:
+        api_key = os.environ.get("OPENROUTER_API_KEY")
+        if not api_key:
+            print(
+                "Error: OPENROUTER_API_KEY environment variable is required.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
     if not pr_number or not repo or not token:
         print(
             "Error: PR_NUMBER, REPO, and GH_TOKEN environment variables are required.",
@@ -843,17 +1015,25 @@ def main() -> None:
     print("Parsing modified line numbers from diff...")
     modified_lines = get_modified_lines(diff_content)
 
-    # Retrieve parameterized configuration for OpenRouter API call
-    model = os.environ.get("OPENROUTER_MODEL", "openrouter/free")
-    base_url = os.environ.get(
-        "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1/chat/completions"
-    )
+    # Retrieve parameterized configuration for the selected provider's API call
+    if provider == "anthropic":
+        model = os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5")
+        base_url = os.environ.get(
+            "ANTHROPIC_BASE_URL", "https://api.anthropic.com/v1/messages"
+        )
+        max_tokens_env, default_max_tokens = "ANTHROPIC_MAX_TOKENS", 8192
+    else:
+        model = os.environ.get("OPENROUTER_MODEL", "openrouter/free")
+        base_url = os.environ.get(
+            "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1/chat/completions"
+        )
+        max_tokens_env, default_max_tokens = "OPENROUTER_MAX_TOKENS", 4096
     try:
-        max_tokens = int(os.environ.get("OPENROUTER_MAX_TOKENS", "4096"))
+        max_tokens = int(os.environ.get(max_tokens_env, str(default_max_tokens)))
     except ValueError:
-        max_tokens = 4096
+        max_tokens = default_max_tokens
 
-    print("Requesting review from OpenRouter...")
+    print(f"Requesting review from provider '{provider}'...")
     raw_response = ""
     json_parsed = False
     review_data = {}
@@ -863,15 +1043,26 @@ def main() -> None:
 
     for attempt in range(1, max_review_attempts + 1):
         try:
-            raw_response = make_openrouter_request(
-                api_key=api_key,
-                diff_content=diff_content,
-                post_summary=post_summary,
-                model=model,
-                base_url=base_url,
-                max_tokens=max_tokens,
-                repo=repo,
-            )
+            if provider == "anthropic":
+                raw_response = make_anthropic_request(
+                    api_key=api_key,
+                    diff_content=diff_content,
+                    post_summary=post_summary,
+                    model=model,
+                    base_url=base_url,
+                    max_tokens=max_tokens,
+                    use_oauth=use_oauth,
+                )
+            else:
+                raw_response = make_openrouter_request(
+                    api_key=api_key,
+                    diff_content=diff_content,
+                    post_summary=post_summary,
+                    model=model,
+                    base_url=base_url,
+                    max_tokens=max_tokens,
+                    repo=repo,
+                )
             review_data = parse_llm_json(raw_response)
             json_parsed = True
             break
