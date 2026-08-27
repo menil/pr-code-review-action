@@ -18,6 +18,13 @@ jobs:
       - name: Run PR Review Action
         uses: ./
         with:
+          # Auto-selects anthropic (preferring the Claude Code subscription token over a
+          # billed API key when both are set) if either Anthropic secret is configured,
+          # otherwise falls back to OpenRouter.
+          provider: ${{ (secrets.ANTHROPIC_API_KEY != '' || secrets.CLAUDE_CODE_OAUTH_TOKEN != '') && 'anthropic' || 'openrouter' }}
           openrouter_api_key: ${{ secrets.OPENROUTER_API_KEY }}
           openrouter_model: ${{ vars.OPENROUTER_MODEL || 'openrouter/free' }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          anthropic_model: ${{ vars.ANTHROPIC_MODEL || 'claude-haiku-4-5' }}
           post_summary: 'false'

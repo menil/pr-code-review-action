@@ -1,14 +1,18 @@
 name: 'AI PR Code Reviewer'
-description: 'Runs automated LLM reviews on PR diffs via OpenRouter and submits inline comments.'
+description: 'Runs automated LLM reviews on PR diffs via OpenRouter or Anthropic and submits inline comments.'
 author: 'meni'
 branding:
   icon: 'code'
   color: 'blue'
 
 inputs:
+  provider:
+    description: "LLM provider to use: 'openrouter' or 'anthropic'"
+    required: false
+    default: 'openrouter'
   openrouter_api_key:
-    description: 'API key for OpenRouter'
-    required: true
+    description: 'API key for OpenRouter (required when provider is openrouter)'
+    required: false
   openrouter_model:
     description: 'Model to use for code review'
     required: false
@@ -19,6 +23,24 @@ inputs:
     default: 'https://openrouter.ai/api/v1/chat/completions'
   openrouter_max_tokens:
     description: 'Maximum tokens for LLM response'
+    required: false
+    default: '8192'
+  anthropic_api_key:
+    description: 'API key for Anthropic (when provider is anthropic; alternative to claude_code_oauth_token). If both are set, claude_code_oauth_token takes precedence.'
+    required: false
+  claude_code_oauth_token:
+    description: 'OAuth token for a Claude Pro/Max subscription, generated via `claude setup-token` (when provider is anthropic; alternative to anthropic_api_key). If both are set, this takes precedence over anthropic_api_key.'
+    required: false
+  anthropic_model:
+    description: 'Claude model to use for code review'
+    required: false
+    default: 'claude-haiku-4-5'
+  anthropic_base_url:
+    description: 'Base URL for the Anthropic Messages API'
+    required: false
+    default: 'https://api.anthropic.com/v1/messages'
+  anthropic_max_tokens:
+    description: 'Maximum tokens for the Claude response'
     required: false
     default: '8192'
   github_token:
@@ -55,10 +77,16 @@ runs:
     - name: Run Review Script
       shell: bash
       env:
+        PROVIDER: ${{ inputs.provider }}
         OPENROUTER_API_KEY: ${{ inputs.openrouter_api_key }}
         OPENROUTER_MODEL: ${{ inputs.openrouter_model }}
         OPENROUTER_BASE_URL: ${{ inputs.openrouter_base_url }}
         OPENROUTER_MAX_TOKENS: ${{ inputs.openrouter_max_tokens }}
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic_api_key }}
+        CLAUDE_CODE_OAUTH_TOKEN: ${{ inputs.claude_code_oauth_token }}
+        ANTHROPIC_MODEL: ${{ inputs.anthropic_model }}
+        ANTHROPIC_BASE_URL: ${{ inputs.anthropic_base_url }}
+        ANTHROPIC_MAX_TOKENS: ${{ inputs.anthropic_max_tokens }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
         REPO: ${{ github.repository }}
         GH_TOKEN: ${{ inputs.github_token }}
