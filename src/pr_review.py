@@ -29,6 +29,7 @@ DEFAULT_EXCLUDE_PATTERNS = [
     r"composer\.lock$",
     r"pdm\.lock$",
     r"Pipfile\.lock$",
+    r"uv\.lock$",
     r"bun\.lockb$",
     r"deno\.lock$",
     # Jest snapshots
