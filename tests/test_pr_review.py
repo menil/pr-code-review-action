@@ -2,7 +2,7 @@
 
 import json
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 from pr_review import (
     get_modified_lines,
     parse_llm_json,
@@ -1720,3 +1720,496 @@ def test_main_missing_anthropic_key() -> None:
         with pytest.raises(SystemExit) as excinfo:
             main()
         assert excinfo.value.code == 1
+
+
+def test_is_token_or_server_error() -> None:
+    """Verify is_token_or_server_error accurately identifies token and server errors."""
+    import urllib.error
+    from pr_review import is_token_or_server_error
+
+    # HTTP status codes that represent token or server errors
+    assert is_token_or_server_error(
+        ValueError("Anthropic HTTP Error 401: Unauthorized")
+    )
+    assert is_token_or_server_error(ValueError("Anthropic HTTP Error 403: Forbidden"))
+    assert is_token_or_server_error(
+        ValueError("Anthropic HTTP Error 429: Too Many Requests")
+    )
+    assert is_token_or_server_error(
+        ValueError("Anthropic HTTP Error 500: Internal Server Error")
+    )
+    assert is_token_or_server_error(ValueError("Anthropic HTTP Error 502: Bad Gateway"))
+    assert is_token_or_server_error(
+        ValueError("Anthropic HTTP Error 503: Service Unavailable")
+    )
+    assert is_token_or_server_error(
+        ValueError("Anthropic HTTP Error 504: Gateway Timeout")
+    )
+    assert is_token_or_server_error(ValueError("Anthropic HTTP Error 529: Overloaded"))
+    assert is_token_or_server_error(
+        ValueError("OpenRouter HTTP Error 402: Payment Required")
+    )
+
+    # Direct urllib.error.HTTPError
+    mock_hdrs = MagicMock()
+    mock_fp = MagicMock()
+    assert is_token_or_server_error(
+        urllib.error.HTTPError(
+            url="http://test", code=401, msg="Unauthorized", hdrs=mock_hdrs, fp=mock_fp
+        )
+    )
+    assert is_token_or_server_error(
+        urllib.error.HTTPError(
+            url="http://test",
+            code=402,
+            msg="Payment Required",
+            hdrs=mock_hdrs,
+            fp=mock_fp,
+        )
+    )
+    assert is_token_or_server_error(
+        urllib.error.HTTPError(
+            url="http://test", code=529, msg="Overloaded", hdrs=mock_hdrs, fp=mock_fp
+        )
+    )
+
+    # Chained exception __cause__ unwrapping (including multi-level chains)
+    cause_http = urllib.error.HTTPError(
+        url="http://test", code=401, msg="Unauthorized", hdrs=mock_hdrs, fp=mock_fp
+    )
+    chained_http = ValueError("Wrapped API error")
+    chained_http.__cause__ = cause_http
+    deep_chained_http = RuntimeError("Outer error")
+    deep_chained_http.__cause__ = chained_http
+    assert is_token_or_server_error(chained_http)
+    assert is_token_or_server_error(deep_chained_http)
+
+    cause_url = urllib.error.URLError("Connection reset")
+    chained_url = ValueError("Wrapped network error")
+    chained_url.__cause__ = cause_url
+    assert is_token_or_server_error(chained_url)
+
+    cause_timeout = TimeoutError("Timed out")
+    chained_timeout = ValueError("Wrapped timeout error")
+    chained_timeout.__cause__ = cause_timeout
+    assert is_token_or_server_error(chained_timeout)
+
+    # URLError and TimeoutError
+    assert is_token_or_server_error(urllib.error.URLError("Connection refused"))
+    assert is_token_or_server_error(TimeoutError("Request timed out"))
+
+    # Anthropic / OpenRouter error messages and types
+    assert is_token_or_server_error(
+        ValueError("Anthropic Error: authentication_error: invalid x-api-key")
+    )
+    assert is_token_or_server_error(
+        ValueError("Anthropic Error: permission_error: token revoked")
+    )
+    assert is_token_or_server_error(
+        ValueError("Anthropic Error: rate_limit_error: quota exceeded")
+    )
+    assert is_token_or_server_error(
+        ValueError("Anthropic Error: overloaded_error: service overloaded")
+    )
+    assert is_token_or_server_error(
+        ValueError("Anthropic Error: api_error: internal server error")
+    )
+    assert is_token_or_server_error(ValueError("Credit balance is too low"))
+    assert is_token_or_server_error(
+        ValueError("Your expired token cannot access this resource")
+    )
+    # Anthropic credit balance error returned under HTTP 400 with invalid_request_error
+    assert is_token_or_server_error(
+        ValueError(
+            'Anthropic HTTP Error 400: {"type":"error","error":{"type":"invalid_request_error",'
+            '"message":"Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing."}}'
+        )
+    )
+
+    # Negative cases: client / syntax / JSON errors MUST NOT be classified as token or server errors
+    assert not is_token_or_server_error(
+        ValueError("Anthropic HTTP Error 400: Bad Request")
+    )
+    assert not is_token_or_server_error(
+        ValueError("Anthropic HTTP Error 404: Not Found")
+    )
+    assert not is_token_or_server_error(
+        ValueError("Anthropic HTTP Error 413: Request Entity Too Large")
+    )
+    assert not is_token_or_server_error(
+        ValueError("Anthropic HTTP Error 422: Unprocessable Entity")
+    )
+    assert not is_token_or_server_error(
+        urllib.error.HTTPError(
+            url="http://test", code=400, msg="Bad Request", hdrs=mock_hdrs, fp=mock_fp
+        )
+    )
+    assert not is_token_or_server_error(
+        ValueError(
+            "Anthropic Error: invalid_request_error: temperature parameter is not supported"
+        )
+    )
+    assert not is_token_or_server_error(
+        ValueError("Anthropic refused to process the request (stop_reason: refusal).")
+    )
+    assert not is_token_or_server_error(
+        ValueError("No valid JSON object found in LLM response")
+    )
+    assert not is_token_or_server_error(ValueError("Anthropic returned empty content."))
+
+
+@patch.dict(
+    "os.environ",
+    {
+        "PROVIDER": "auto",
+        "CLAUDE_CODE_OAUTH_TOKEN": "expired_oauth_token",
+        "OPENROUTER_API_KEY": "valid_openrouter_key",
+        "PR_NUMBER": "12",
+        "REPO": "owner/repo",
+        "GH_TOKEN": "fake_github_token",
+        "POST_SUMMARY": "true",
+    },
+    clear=True,
+)
+@patch("os.path.exists")
+@patch("builtins.open")
+@patch("pr_review.make_openrouter_request")
+@patch("pr_review.make_anthropic_request")
+@patch("pr_review.submit_github_review")
+def test_main_fallback_from_expired_claude_token_to_openrouter(
+    mock_submit: MagicMock,
+    mock_anthropic_req: MagicMock,
+    mock_openrouter_req: MagicMock,
+    mock_open: MagicMock,
+    mock_exists: MagicMock,
+) -> None:
+    """Verify main() falls back from an expired Claude OAuth token (401) to OpenRouter."""
+    from pr_review import main
+
+    mock_exists.return_value = True
+    mock_file = MagicMock()
+    mock_file.read.return_value = (
+        "diff --git a/test.py b/test.py\n@@ -1 +1 @@\n-old\n+new\n"
+    )
+    mock_open.return_value.__enter__.return_value = mock_file
+
+    mock_anthropic_req.side_effect = ValueError(
+        'Anthropic HTTP Error 401: {"type":"error","error":{"type":"authentication_error","message":"invalid token"}}'
+    )
+    mock_openrouter_req.return_value = json.dumps(
+        {"summary": "Fallback review complete", "comments": []}
+    )
+
+    main()
+
+    # Claude was attempted first using oauth
+    mock_anthropic_req.assert_called_once()
+    assert mock_anthropic_req.call_args.kwargs["use_oauth"] is True
+    # Fallback to OpenRouter was called
+    mock_openrouter_req.assert_called_once()
+    assert mock_openrouter_req.call_args.kwargs["api_key"] == "valid_openrouter_key"
+    mock_submit.assert_called_once()
+
+
+@patch.dict(
+    "os.environ",
+    {
+        "PROVIDER": "auto",
+        "CLAUDE_CODE_OAUTH_TOKEN": "oauth_token",
+        "OPENROUTER_API_KEY": "openrouter_key",
+        "PR_NUMBER": "12",
+        "REPO": "owner/repo",
+        "GH_TOKEN": "fake_github_token",
+        "POST_SUMMARY": "true",
+    },
+    clear=True,
+)
+@patch("os.path.exists")
+@patch("builtins.open")
+@patch("pr_review.make_openrouter_request")
+@patch("pr_review.make_anthropic_request")
+@patch("pr_review.submit_github_review")
+def test_main_fallback_from_claude_529_overloaded_to_openrouter(
+    mock_submit: MagicMock,
+    mock_anthropic_req: MagicMock,
+    mock_openrouter_req: MagicMock,
+    mock_open: MagicMock,
+    mock_exists: MagicMock,
+) -> None:
+    """Verify main() falls back from Claude on 529 Overloaded error to OpenRouter."""
+    from pr_review import main
+
+    mock_exists.return_value = True
+    mock_file = MagicMock()
+    mock_file.read.return_value = (
+        "diff --git a/test.py b/test.py\n@@ -1 +1 @@\n-old\n+new\n"
+    )
+    mock_open.return_value.__enter__.return_value = mock_file
+
+    mock_anthropic_req.side_effect = ValueError("Anthropic HTTP Error 529: Overloaded")
+    mock_openrouter_req.return_value = json.dumps(
+        {"summary": "Review after 529", "comments": []}
+    )
+
+    main()
+
+    mock_anthropic_req.assert_called_once()
+    mock_openrouter_req.assert_called_once()
+    mock_submit.assert_called_once()
+
+
+@patch.dict(
+    "os.environ",
+    {
+        "PROVIDER": "auto",
+        "CLAUDE_CODE_OAUTH_TOKEN": "oauth_token",
+        "OPENROUTER_API_KEY": "openrouter_key",
+        "PR_NUMBER": "12",
+        "REPO": "owner/repo",
+        "GH_TOKEN": "fake_github_token",
+        "POST_SUMMARY": "true",
+    },
+    clear=True,
+)
+@patch("time.sleep")
+@patch("os.path.exists")
+@patch("builtins.open")
+@patch("pr_review.make_openrouter_request")
+@patch("pr_review.make_anthropic_request")
+@patch("pr_review.submit_github_review")
+def test_main_no_fallback_on_400_bad_request(
+    mock_submit: MagicMock,
+    mock_anthropic_req: MagicMock,
+    mock_openrouter_req: MagicMock,
+    mock_open: MagicMock,
+    mock_exists: MagicMock,
+    mock_sleep: MagicMock,
+) -> None:
+    """Verify main() does NOT fall back to OpenRouter on client 400 Bad Request errors."""
+    from pr_review import main
+
+    mock_exists.return_value = True
+    mock_file = MagicMock()
+    mock_file.read.return_value = (
+        "diff --git a/test.py b/test.py\n@@ -1 +1 @@\n-old\n+new\n"
+    )
+    mock_open.return_value.__enter__.return_value = mock_file
+
+    mock_anthropic_req.side_effect = ValueError(
+        "Anthropic HTTP Error 400: Bad Request - invalid parameter"
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        main()
+    assert excinfo.value.code == 1
+
+    # Retried 3 times on deterministic client error without falling back
+    assert mock_anthropic_req.call_count == 3
+    assert mock_sleep.call_count == 2
+    mock_sleep.assert_has_calls([call(1.0), call(2.0)])
+    mock_openrouter_req.assert_not_called()
+    mock_submit.assert_not_called()
+
+
+@patch.dict(
+    "os.environ",
+    {
+        "PROVIDER": "auto",
+        "CLAUDE_CODE_OAUTH_TOKEN": "oauth_token",
+        "ANTHROPIC_API_KEY": "billed_key",
+        "OPENROUTER_API_KEY": "openrouter_key",
+        "PR_NUMBER": "12",
+        "REPO": "owner/repo",
+        "GH_TOKEN": "fake_github_token",
+        "POST_SUMMARY": "true",
+    },
+    clear=True,
+)
+@patch("os.path.exists")
+@patch("builtins.open")
+@patch("pr_review.make_openrouter_request")
+@patch("pr_review.make_anthropic_request")
+@patch("pr_review.submit_github_review")
+def test_main_fallback_cascade_oauth_to_api_key_to_openrouter(
+    mock_submit: MagicMock,
+    mock_anthropic_req: MagicMock,
+    mock_openrouter_req: MagicMock,
+    mock_open: MagicMock,
+    mock_exists: MagicMock,
+) -> None:
+    """Verify main() cascades from OAuth token error to API key error to OpenRouter."""
+    from pr_review import main
+
+    mock_exists.return_value = True
+    mock_file = MagicMock()
+    mock_file.read.return_value = (
+        "diff --git a/test.py b/test.py\n@@ -1 +1 @@\n-old\n+new\n"
+    )
+    mock_open.return_value.__enter__.return_value = mock_file
+
+    mock_anthropic_req.side_effect = [
+        ValueError("Anthropic HTTP Error 401: Unauthorized"),  # OAuth token failure
+        ValueError("Anthropic HTTP Error 429: Rate limit exceeded"),  # API key failure
+    ]
+    mock_openrouter_req.return_value = json.dumps(
+        {"summary": "OpenRouter cascade review", "comments": []}
+    )
+
+    main()
+
+    assert mock_anthropic_req.call_count == 2
+    # First attempt used OAuth token
+    assert mock_anthropic_req.call_args_list[0].kwargs["use_oauth"] is True
+    assert mock_anthropic_req.call_args_list[0].kwargs["api_key"] == "oauth_token"
+    # Second attempt cascaded to billed API key
+    assert mock_anthropic_req.call_args_list[1].kwargs["use_oauth"] is False
+    assert mock_anthropic_req.call_args_list[1].kwargs["api_key"] == "billed_key"
+
+    # Third attempt fell back to OpenRouter
+    mock_openrouter_req.assert_called_once()
+    assert mock_openrouter_req.call_args.kwargs["api_key"] == "openrouter_key"
+    mock_submit.assert_called_once()
+    assert mock_submit.call_args[0][3] == "OpenRouter cascade review"
+
+
+@patch.dict(
+    "os.environ",
+    {
+        "PROVIDER": "anthropic",
+        "ANTHROPIC_API_KEY": "billed_key",
+        "OPENROUTER_API_KEY": "openrouter_key",
+        "PR_NUMBER": "12",
+        "REPO": "owner/repo",
+        "GH_TOKEN": "fake_github_token",
+        "POST_SUMMARY": "true",
+    },
+    clear=True,
+)
+@patch("time.sleep")
+@patch("os.path.exists")
+@patch("builtins.open")
+@patch("pr_review.make_openrouter_request")
+@patch("pr_review.make_anthropic_request")
+@patch("pr_review.submit_github_review")
+def test_main_explicit_anthropic_does_not_fallback_to_openrouter(
+    mock_submit: MagicMock,
+    mock_anthropic_req: MagicMock,
+    mock_openrouter_req: MagicMock,
+    mock_open: MagicMock,
+    mock_exists: MagicMock,
+    mock_sleep: MagicMock,
+) -> None:
+    """Verify PROVIDER=anthropic strictly stays on Anthropic and never falls back to OpenRouter."""
+    from pr_review import main
+
+    mock_exists.return_value = True
+    mock_file = MagicMock()
+    mock_file.read.return_value = (
+        "diff --git a/test.py b/test.py\n@@ -1 +1 @@\n-old\n+new\n"
+    )
+    mock_open.return_value.__enter__.return_value = mock_file
+
+    mock_anthropic_req.side_effect = ValueError(
+        "Anthropic HTTP Error 401: Unauthorized"
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        main()
+    assert excinfo.value.code == 1
+
+    mock_anthropic_req.assert_called()
+    mock_openrouter_req.assert_not_called()
+    mock_submit.assert_not_called()
+
+
+@patch.dict(
+    "os.environ",
+    {
+        "PROVIDER": "auto",
+        "OPENROUTER_API_KEY": "openrouter_key",
+        "PR_NUMBER": "12",
+        "REPO": "owner/repo",
+        "GH_TOKEN": "fake_github_token",
+        "POST_SUMMARY": "true",
+    },
+    clear=True,
+)
+@patch("time.sleep")
+@patch("os.path.exists")
+@patch("builtins.open")
+@patch("pr_review.make_openrouter_request")
+@patch("pr_review.submit_github_review")
+def test_main_token_error_no_fallback_candidate_exits(
+    mock_submit: MagicMock,
+    mock_openrouter_req: MagicMock,
+    mock_open: MagicMock,
+    mock_exists: MagicMock,
+    mock_sleep: MagicMock,
+) -> None:
+    """Verify main() retries and exits when a token error occurs and no further fallback is available."""
+    from pr_review import main
+
+    mock_exists.return_value = True
+    mock_file = MagicMock()
+    mock_file.read.return_value = (
+        "diff --git a/test.py b/test.py\n@@ -1 +1 @@\n-old\n+new\n"
+    )
+    mock_open.return_value.__enter__.return_value = mock_file
+
+    mock_openrouter_req.side_effect = ValueError(
+        "OpenRouter HTTP Error 401: Unauthorized"
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        main()
+    assert excinfo.value.code == 1
+
+    assert mock_openrouter_req.call_count == 3
+    assert mock_sleep.call_count == 2
+    mock_submit.assert_not_called()
+
+
+@patch.dict(
+    "os.environ",
+    {
+        "PROVIDER": "openrouter",
+        "CLAUDE_CODE_OAUTH_TOKEN": "oauth_token",
+        "OPENROUTER_API_KEY": "openrouter_key",
+        "PR_NUMBER": "12",
+        "REPO": "owner/repo",
+        "GH_TOKEN": "fake_github_token",
+        "POST_SUMMARY": "true",
+    },
+    clear=True,
+)
+@patch("os.path.exists")
+@patch("builtins.open")
+@patch("pr_review.make_openrouter_request")
+@patch("pr_review.make_anthropic_request")
+@patch("pr_review.submit_github_review")
+def test_main_explicit_openrouter_bypasses_claude(
+    mock_submit: MagicMock,
+    mock_anthropic_req: MagicMock,
+    mock_openrouter_req: MagicMock,
+    mock_open: MagicMock,
+    mock_exists: MagicMock,
+) -> None:
+    """Verify PROVIDER=openrouter directly uses OpenRouter and ignores Claude tokens."""
+    from pr_review import main
+
+    mock_exists.return_value = True
+    mock_file = MagicMock()
+    mock_file.read.return_value = (
+        "diff --git a/test.py b/test.py\n@@ -1 +1 @@\n-old\n+new\n"
+    )
+    mock_open.return_value.__enter__.return_value = mock_file
+
+    mock_openrouter_req.return_value = json.dumps(
+        {"summary": "Direct OpenRouter review", "comments": []}
+    )
+
+    main()
+
+    mock_anthropic_req.assert_not_called()
+    mock_openrouter_req.assert_called_once()
+    mock_submit.assert_called_once()

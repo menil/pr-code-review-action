@@ -920,50 +920,172 @@ def submit_github_review(
         raise
 
 
+class ProviderConfig:
+    """Configuration for an LLM provider candidate attempt."""
+
+    def __init__(
+        self,
+        name: str,
+        api_key: str,
+        model: str,
+        base_url: str,
+        max_tokens: int,
+        use_oauth: bool = False,
+        auth_desc: str = "",
+    ) -> None:
+        self.name = name
+        self.api_key = api_key
+        self.model = model
+        self.base_url = base_url
+        self.max_tokens = max_tokens
+        self.use_oauth = use_oauth
+        self.auth_desc = auth_desc
+
+
+def is_token_or_server_error(error: Exception) -> bool:
+    """Determine whether an error is an authentication/token error or a 5xx/server error.
+
+    Returns True for:
+      - HTTP 401 (Unauthorized: invalid, expired, or missing credentials)
+      - HTTP 402 (Payment Required: depleted credits/balance on OpenRouter)
+      - HTTP 403 (Forbidden: inactive subscription, permission denied)
+      - HTTP 429 (Too Many Requests: rate limit or quota exceeded)
+      - HTTP 5xx (500 <= status < 600, including 500, 502, 503, 504, 529 Overloaded)
+      - Depleted balance / credit exhaustion (including Anthropic's HTTP 400 credit balance error)
+      - Connection drops, DNS resolution failures, and request timeouts (URLError, TimeoutError)
+      - API error messages indicating authentication, permission, rate limit, quota, or server overload
+
+    Returns False for client/request errors (e.g., standard HTTP 400 Bad Request, 404 Not Found, 413, 422,
+    invalid parameters, model refusals, or JSON formatting errors).
+    """
+    err_str = str(error)
+    lower_err = err_str.lower()
+
+    # Credit exhaustion, billing, balance depletion, and account quota errors must trigger
+    # fallback even when returned under HTTP 400 with invalid_request_error (as done by Anthropic):
+    # "Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing..."
+    if any(
+        k in lower_err
+        for k in (
+            "credit balance",
+            "credit_balance",
+            "insufficient credits",
+            "insufficient_quota",
+            "quota",
+            "billing",
+            "purchase credits",
+            "plans & billing",
+            "payment required",
+            "account suspended",
+            "account deactivated",
+        )
+    ):
+        return True
+
+    # 1. Traverse full exception chain (__cause__ and __context__) for HTTPError, URLError, TimeoutError
+    curr: BaseException | None = error
+    visited = set()
+    while curr is not None and id(curr) not in visited:
+        visited.add(id(curr))
+        if isinstance(curr, urllib.error.HTTPError):
+            if curr.code in (401, 402, 403, 429) or (500 <= curr.code < 600):
+                return True
+            return False
+        if isinstance(curr, (urllib.error.URLError, TimeoutError)):
+            return True
+        curr = curr.__cause__ or curr.__context__
+
+    # 3. Check for HTTP status code in error message (e.g. "HTTP Error 401", "HTTP status 500")
+    http_code_match = re.search(
+        r"HTTP (?:Error|status)\s*(\d{3})", err_str, re.IGNORECASE
+    )
+    if http_code_match:
+        code = int(http_code_match.group(1))
+        if code in (401, 402, 403, 429) or (500 <= code < 600):
+            return True
+        return False
+
+    # 4. Check for known token and server error types or phrases
+    # Explicit non-token/client error patterns should never trigger fallback
+    if any(
+        k in lower_err
+        for k in ("invalid_request_error", "bad request", "stop_reason: refusal")
+    ):
+        return False
+
+    token_or_server_patterns = [
+        r"authentication_error",
+        r"permission_error",
+        r"rate_limit_error",
+        r"overloaded_error",
+        r"api_error",
+        r"\b(?:invalid|expired|revoked|missing)\s+(?:api[_-]?key|token|credentials?)\b",
+        r"\btoken\s+(?:has\s+)?expired\b",
+        r"\bunauthorized\b",
+        r"\brate\s+limit(?:ed)?\b",
+        r"\bquota\s+(?:exceeded|limit)\b",
+        r"\bcredit\s+balance\b",
+        r"\boverloaded\b",
+        r"\binternal\s+server\s+error\b",
+        r"\bbad\s+gateway\b",
+        r"\bservice\s+unavailable\b",
+        r"\bgateway\s+timeout\b",
+    ]
+    if any(re.search(pat, lower_err) for pat in token_or_server_patterns):
+        return True
+
+    return False
+
+
 def main() -> None:
     """Validate environment configurations, process diff content, and submit review."""
     # Load and validate environment variables
-    provider = os.environ.get("PROVIDER", "openrouter").strip().lower()
+    provider = os.environ.get("PROVIDER", "auto").strip().lower()
     pr_number = os.environ.get("PR_NUMBER")
     repo = os.environ.get("REPO")
     token = os.environ.get("GH_TOKEN")
     post_summary_env = os.environ.get("POST_SUMMARY", "true")
     post_summary = post_summary_env.lower() in ("true", "1", "yes")
 
-    if provider not in ("openrouter", "anthropic"):
+    if provider not in ("openrouter", "anthropic", "auto"):
         print(
-            f"Error: PROVIDER must be 'openrouter' or 'anthropic', got '{provider}'.",
+            f"Error: PROVIDER must be 'auto', 'anthropic', or 'openrouter', got '{provider}'.",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    # Each provider reads its own credentials so all of them can be configured side by side.
-    use_oauth = False
-    if provider == "anthropic":
-        # The Anthropic provider accepts either a billed API key or a Claude Pro/Max
-        # subscription OAuth token (from `claude setup-token`). The OAuth token takes
-        # precedence when both are set, so a configured Claude Code subscription is
-        # preferred over a billed API key.
-        api_key = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
-        use_oauth = bool(api_key)
-        if not api_key:
-            api_key = os.environ.get("ANTHROPIC_API_KEY")
+    claude_code_oauth_token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+    anthropic_api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    openrouter_api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
 
-        if not api_key:
+    if provider == "openrouter":
+        if not openrouter_api_key:
+            print(
+                "Error: OPENROUTER_API_KEY environment variable is required.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    elif provider == "anthropic":
+        if not claude_code_oauth_token and not anthropic_api_key:
             print(
                 "Error: provider is 'anthropic' but neither ANTHROPIC_API_KEY nor "
                 "CLAUDE_CODE_OAUTH_TOKEN environment variable is set.",
                 file=sys.stderr,
             )
             sys.exit(1)
-    else:
-        api_key = os.environ.get("OPENROUTER_API_KEY")
-        if not api_key:
+    else:  # auto
+        if (
+            not claude_code_oauth_token
+            and not anthropic_api_key
+            and not openrouter_api_key
+        ):
             print(
-                "Error: OPENROUTER_API_KEY environment variable is required.",
+                "Error: No LLM credentials provided. Please set CLAUDE_CODE_OAUTH_TOKEN, "
+                "ANTHROPIC_API_KEY, or OPENROUTER_API_KEY.",
                 file=sys.stderr,
             )
             sys.exit(1)
+
     if not pr_number or not repo or not token:
         print(
             "Error: PR_NUMBER, REPO, and GH_TOKEN environment variables are required.",
@@ -1016,66 +1138,150 @@ def main() -> None:
     print("Parsing modified line numbers from diff...")
     modified_lines = get_modified_lines(diff_content)
 
-    # Retrieve parameterized configuration for the selected provider's API call
-    if provider == "anthropic":
-        model = os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5")
-        base_url = os.environ.get(
-            "ANTHROPIC_BASE_URL", "https://api.anthropic.com/v1/messages"
-        )
-        max_tokens_env, default_max_tokens = "ANTHROPIC_MAX_TOKENS", 8192
-    else:
-        model = os.environ.get("OPENROUTER_MODEL", "openrouter/free")
-        base_url = os.environ.get(
-            "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1/chat/completions"
-        )
-        max_tokens_env, default_max_tokens = "OPENROUTER_MAX_TOKENS", 4096
+    # Resolve provider endpoints and models
+    anthropic_model = os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5")
+    anthropic_base_url = os.environ.get(
+        "ANTHROPIC_BASE_URL", "https://api.anthropic.com/v1/messages"
+    )
     try:
-        max_tokens = int(os.environ.get(max_tokens_env, str(default_max_tokens)))
+        anthropic_max_tokens = int(os.environ.get("ANTHROPIC_MAX_TOKENS", "8192"))
     except ValueError:
-        max_tokens = default_max_tokens
+        anthropic_max_tokens = 8192
 
-    print(f"Requesting review from provider '{provider}'...")
+    openrouter_model = os.environ.get("OPENROUTER_MODEL", "openrouter/free")
+    openrouter_base_url = os.environ.get(
+        "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1/chat/completions"
+    )
+    try:
+        openrouter_max_tokens = int(os.environ.get("OPENROUTER_MAX_TOKENS", "8192"))
+    except ValueError:
+        openrouter_max_tokens = 8192
+
+    # Build candidate providers based on configuration and available credentials
+    candidates: list[ProviderConfig] = []
+    if provider in ("auto", "anthropic"):
+        # Claude Pro/Max subscription OAuth token takes precedence over billed API key
+        if claude_code_oauth_token:
+            candidates.append(
+                ProviderConfig(
+                    name="anthropic",
+                    api_key=claude_code_oauth_token,
+                    model=anthropic_model,
+                    base_url=anthropic_base_url,
+                    max_tokens=anthropic_max_tokens,
+                    use_oauth=True,
+                    auth_desc="Claude Pro/Max OAuth token",
+                )
+            )
+        if anthropic_api_key:
+            candidates.append(
+                ProviderConfig(
+                    name="anthropic",
+                    api_key=anthropic_api_key,
+                    model=anthropic_model,
+                    base_url=anthropic_base_url,
+                    max_tokens=anthropic_max_tokens,
+                    use_oauth=False,
+                    auth_desc="Anthropic API key",
+                )
+            )
+    # OpenRouter candidate: used in auto mode as fallback/primary, or explicitly in openrouter mode
+    if provider in ("auto", "openrouter"):
+        if openrouter_api_key:
+            candidates.append(
+                ProviderConfig(
+                    name="openrouter",
+                    api_key=openrouter_api_key,
+                    model=openrouter_model,
+                    base_url=openrouter_base_url,
+                    max_tokens=openrouter_max_tokens,
+                    use_oauth=False,
+                    auth_desc="OpenRouter API key",
+                )
+            )
+
     raw_response = ""
     json_parsed = False
-    review_data = {}
-
+    review_data: dict[str, Any] = {}
+    last_exception: Exception | None = None
     max_review_attempts = 3
-    last_exception = None
 
-    for attempt in range(1, max_review_attempts + 1):
-        try:
-            if provider == "anthropic":
-                raw_response = make_anthropic_request(
-                    api_key=api_key,
-                    diff_content=diff_content,
-                    post_summary=post_summary,
-                    model=model,
-                    base_url=base_url,
-                    max_tokens=max_tokens,
-                    use_oauth=use_oauth,
-                )
-            else:
-                raw_response = make_openrouter_request(
-                    api_key=api_key,
-                    diff_content=diff_content,
-                    post_summary=post_summary,
-                    model=model,
-                    base_url=base_url,
-                    max_tokens=max_tokens,
-                    repo=repo,
-                )
-            review_data = parse_llm_json(raw_response)
-            json_parsed = True
+    for provider_idx, config in enumerate(candidates):
+        has_fallback = provider_idx + 1 < len(candidates)
+        next_provider_name = candidates[provider_idx + 1].name if has_fallback else None
+        print(
+            f"Requesting review from provider '{config.name}' (auth: {config.auth_desc})..."
+        )
+
+        should_fallback = False
+        for attempt in range(1, max_review_attempts + 1):
+            raw_response = ""
+            try:
+                if config.name == "anthropic":
+                    raw_response = make_anthropic_request(
+                        api_key=config.api_key,
+                        diff_content=diff_content,
+                        post_summary=post_summary,
+                        model=config.model,
+                        base_url=config.base_url,
+                        max_tokens=config.max_tokens,
+                        use_oauth=config.use_oauth,
+                    )
+                elif config.name == "openrouter":
+                    raw_response = make_openrouter_request(
+                        api_key=config.api_key,
+                        diff_content=diff_content,
+                        post_summary=post_summary,
+                        model=config.model,
+                        base_url=config.base_url,
+                        max_tokens=config.max_tokens,
+                        repo=repo,
+                    )
+                else:
+                    raise ValueError(f"Unsupported provider: {config.name}")
+                review_data = parse_llm_json(raw_response)
+                json_parsed = True
+                break
+            except (
+                ValueError,
+                KeyError,
+                TypeError,
+                urllib.error.URLError,
+                TimeoutError,
+                OSError,
+            ) as e:
+                last_exception = e
+                # Check if this error is an authentication/token error or a 5xx/server error
+                if is_token_or_server_error(e):
+                    if has_fallback:
+                        print(
+                            f"Warning: Provider '{config.name}' ({config.auth_desc}) failed with "
+                            f"token/server error: {e}. Falling back to '{next_provider_name}'...",
+                            file=sys.stderr,
+                        )
+                        should_fallback = True
+                        break
+                    else:
+                        print(
+                            f"Warning: Provider '{config.name}' ({config.auth_desc}) failed with "
+                            f"token/server error: {e}. No fallback provider available.",
+                            file=sys.stderr,
+                        )
+                # For non-token/non-500 errors or when no fallback is configured, retry if attempts remain
+                if attempt < max_review_attempts:
+                    print(
+                        f"Warning: Review attempt {attempt} failed (error or malformed JSON): {e}. "
+                        "Retrying request...",
+                        file=sys.stderr,
+                    )
+                    time.sleep(1.0 * attempt)
+
+        if json_parsed:
             break
-        except Exception as e:
-            last_exception = e
-            if attempt < max_review_attempts:
-                print(
-                    f"Warning: Review attempt {attempt} failed (error or malformed JSON): {e}. "
-                    "Retrying request...",
-                    file=sys.stderr,
-                )
-                time.sleep(2.0 * attempt)
+        if should_fallback:
+            continue
+        # Non-fallback error or attempts exhausted without fallback
+        break
 
     if json_parsed:
         summary = review_data.get("summary", "Automated code review completed.")

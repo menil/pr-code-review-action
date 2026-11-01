@@ -67,18 +67,21 @@ Set `provider: anthropic` and supply credentials using **one** of the two method
 > [!NOTE]
 > Provide credentials for whichever provider you select. If both `anthropic_api_key` and `claude_code_oauth_token` are set, `claude_code_oauth_token` takes precedence — a configured Claude Code subscription is preferred over a billed API key. On the Opus/Sonnet-5 tiers the action deliberately omits `temperature`, so any current Claude model works out of the box.
 
-**Choosing automatically based on which secrets exist** — rather than hardcoding a provider, a calling workflow can pass all three credentials through and compute `provider` from whichever secrets are actually set:
+**Choosing automatically with fallback (Default)** — by default (`provider: auto`), the action automatically prefers `claude_code_oauth_token` (Claude Pro/Max subscription), then `anthropic_api_key` (billed API key). If neither Claude credential is set, or if Claude fails due to token errors (e.g., expired OAuth subscription token, invalid key, rate limit / quota exceeded) or 5xx server errors, the action automatically falls back to `openrouter_api_key`:
 
 ```yaml
       - name: Run Review Action
         uses: menil/pr-code-review-action@main
         with:
-          provider: ${{ (secrets.ANTHROPIC_API_KEY != '' || secrets.CLAUDE_CODE_OAUTH_TOKEN != '') && 'anthropic' || 'openrouter' }}
+          provider: auto   # default; optional
           openrouter_api_key: ${{ secrets.OPENROUTER_API_KEY }}
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 ```
-With this pattern: only `CLAUDE_CODE_OAUTH_TOKEN` set → uses your subscription; only `ANTHROPIC_API_KEY` set → uses billed API access; both set → the subscription token wins; neither set → falls back to OpenRouter.
+With this setup:
+1. Active Claude Code subscription: uses subscription token without billing OpenRouter.
+2. Expired Claude Code subscription / invalid token / Anthropic 5xx outage: automatically falls back to OpenRouter to ensure your PR review never fails or blocks CI.
+3. Client/request errors (such as HTTP 400 Bad Request): surfaced immediately without falling back to prevent masking configuration issues.
 
 ### Private Repositories (Personal / Standalone Accounts)
 If you fork the action into a private repository (which cannot be natively referenced by public workflows), check it out dynamically using a Personal Access Token (PAT) with `repo` scope first:
@@ -117,13 +120,13 @@ jobs:
 
 | Input | Description | Required | Default |
 |-------|-------------|----------|---------|
-| `provider` | LLM provider: `openrouter` or `anthropic` | No | `openrouter` |
-| `openrouter_api_key` | API key from OpenRouter | When `provider` is `openrouter` | - |
+| `provider` | LLM provider: `auto`, `anthropic`, or `openrouter` | No | `auto` |
+| `openrouter_api_key` | API key from OpenRouter | When `provider` is `openrouter`, or when used in `auto` mode | - |
 | `openrouter_model` | Model used for review | No | `openrouter/free` |
 | `openrouter_base_url` | Base completions URL | No | `https://openrouter.ai/api/v1/chat/completions` |
 | `openrouter_max_tokens`| Max completion tokens | No | `8192` |
-| `anthropic_api_key` | API key from Anthropic (`sk-ant-...`); alternative to `claude_code_oauth_token` | When `provider` is `anthropic` (unless `claude_code_oauth_token` is set) | - |
-| `claude_code_oauth_token` | Claude Pro/Max subscription OAuth token from `claude setup-token`; alternative to `anthropic_api_key` | When `provider` is `anthropic` (unless `anthropic_api_key` is set) | - |
+| `anthropic_api_key` | API key from Anthropic (`sk-ant-...`); alternative to `claude_code_oauth_token` | When `provider` is `anthropic` (unless `claude_code_oauth_token` is set), or when used in `auto` mode | - |
+| `claude_code_oauth_token` | Claude Pro/Max subscription OAuth token from `claude setup-token`; alternative to `anthropic_api_key` | When `provider` is `anthropic` (unless `anthropic_api_key` is set), or when used in `auto` mode | - |
 | `anthropic_model` | Claude model used for review | No | `claude-haiku-4-5` |
 | `anthropic_base_url` | Base Messages API URL | No | `https://api.anthropic.com/v1/messages` |
 | `anthropic_max_tokens` | Max tokens for the Claude response | No | `8192` |
