@@ -7,11 +7,11 @@ branding:
 
 inputs:
   provider:
-    description: "LLM provider to use: 'openrouter' or 'anthropic'"
+    description: "LLM provider to use: 'auto', 'anthropic', or 'openrouter'. Default is 'auto' (prefers Claude Code token, falling back to OpenRouter if unavailable or on token/500 errors)."
     required: false
-    default: 'openrouter'
+    default: 'auto'
   openrouter_api_key:
-    description: 'API key for OpenRouter (required when provider is openrouter)'
+    description: 'API key for OpenRouter (required when provider is openrouter, or as fallback/primary in auto mode)'
     required: false
   openrouter_model:
     description: 'Model to use for code review'
@@ -26,10 +26,10 @@ inputs:
     required: false
     default: '8192'
   anthropic_api_key:
-    description: 'API key for Anthropic (when provider is anthropic; alternative to claude_code_oauth_token). If both are set, claude_code_oauth_token takes precedence.'
+    description: 'API key for Anthropic (when provider is anthropic or auto; alternative to claude_code_oauth_token). If both are set, claude_code_oauth_token takes precedence.'
     required: false
   claude_code_oauth_token:
-    description: 'OAuth token for a Claude Pro/Max subscription, generated via `claude setup-token` (when provider is anthropic; alternative to anthropic_api_key). If both are set, this takes precedence over anthropic_api_key.'
+    description: 'OAuth token for a Claude Pro/Max subscription, generated via `claude setup-token` (when provider is anthropic or auto; alternative to anthropic_api_key). If both are set, this takes precedence over anthropic_api_key.'
     required: false
   anthropic_model:
     description: 'Claude model to use for code review'
